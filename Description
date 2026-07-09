@@ -10,3 +10,11 @@ Samsung 990 EVO Plus SSD 1TB*1
 reSpeaker XVF3800 USB Microphone Array*1
 Talentcell Rechargeable 12V*1
 
+V1.0.0
+enable identify object through two camera.
+Track RGB signals across image rows and columns. 
+First, perform an initial separation based on color change: if the color changes dramatically, separate the region into different objects. 
+Second, perform another separation based on depth: if the depth change is not smooth, separate the region into different objects. 
+Finally, run a CNN to extract visual features from each separated region.
+In this stage, calculation time doesn't matter. It's acceptable that the algorthm is too complicated.
+V0.0.1 changing the logic. Introduce attention. Use attention to select region to do depth measure and object features extract.
