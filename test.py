@@ -1,20 +1,28 @@
 import cv2
-from attention import find_attention_window
+from attention import Attention
+
+
+class Observation:
+
+    def __init__(self, left):
+        self.left = left
 
 
 def main():
 
-    image = cv2.imread("test/test3.png")
+    image = cv2.imread("test/test1.png")
 
     if image is None:
         print("Image load failed.")
         return
 
-    attention = find_attention_window(image)
+    observation = Observation(image)
 
-    print("Attention Window:", attention)
+    attention = Attention(observation)
 
-    x, y, w, h = attention
+    x, y, w, h = attention.focus
+
+    print("Attention Window:", attention.focus)
 
     result = image.copy()
 

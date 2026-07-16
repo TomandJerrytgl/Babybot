@@ -1,9 +1,6 @@
 import numpy as np
 
 
-# 在这部分希望实现 region = Attention(observation)
-# 返回一个 region 进行后续处理
-
 class Attention:
 
     def __init__(self, observation, object=None):
@@ -14,72 +11,155 @@ class Attention:
         if object is None:
             self.focus = self.default_focus()
 
+    ##############################################################
+
     def default_focus(self):
 
         left = self.observation.left
 
-        return find_attention_window(left)
+        return self.find_attention_window(left)
 
+    ##############################################################
 
-def find_attention_window(
-        image,
-        window_size=256,
-        step=16,
-        vivid_weight=1.0,
-        center_weight=20.0):
+    def brightness_preference(self, brightness):
 
-    height, width = image.shape[:2]
+        ideal = 170
+        sigma = 60
 
-    center_x = width / 2
-    center_y = height / 2
+        score = np.exp(
+            -((brightness - ideal) ** 2) /
+            (2 * sigma * sigma)
+        )
 
-    max_distance = np.sqrt(center_x**2 + center_y**2)
+        return score
 
-    best_score = -1e9
-    best_window = None
+    ##############################################################
 
-    for y in range(0, height - window_size + 1, step):
+    def visual_saliency(
+            self,
+            image,
+            x,
+            y,
+            window_size):
 
-        for x in range(0, width - window_size + 1, step):
+        ##########################################################
+        # Current Window
+        ##########################################################
 
-            window = image[
-                y:y + window_size,
-                x:x + window_size
-            ]
+        window = image[
+            y:y+window_size,
+            x:x+window_size
+        ]
 
-            r = window[:, :, 0]
-            g = window[:, :, 1]
-            b = window[:, :, 2]
+        ##########################################################
+        # Brightness
+        ##########################################################
 
-            vividness = np.mean(
-                np.maximum.reduce([r, g, b]) -
-                np.minimum.reduce([r, g, b])
-            )
+        r = window[:, :, 0].astype(np.float32)
+        g = window[:, :, 1].astype(np.float32)
+        b = window[:, :, 2].astype(np.float32)
 
-            wx = x + window_size / 2
-            wy = y + window_size / 2
+        brightness = np.mean(
+            0.299 * r +
+            0.587 * g +
+            0.114 * b
+        )
 
-            distance = np.sqrt(
-                (wx - center_x) ** 2 +
-                (wy - center_y) ** 2
-            )
+        brightness_score = self.brightness_preference(
+            brightness
+        )
 
-            center_score = 1 - distance / max_distance
+        ##########################################################
+        # Local Contrast
+        ##########################################################
 
-            score = (
-                vivid_weight * vividness +
-                center_weight * center_score
-            )
+        h, w = image.shape[:2]
 
-            if score > best_score:
+        background_size = window_size * 4
 
-                best_score = score
+        x1 = max(0, x - background_size // 2)
+        y1 = max(0, y - background_size // 2)
 
-                best_window = (
+        x2 = min(
+            w,
+            x + window_size + background_size // 2
+        )
+
+        y2 = min(
+            h,
+            y + window_size + background_size // 2
+        )
+
+        background = image[
+            y1:y2,
+            x1:x2
+        ]
+
+        window_mean = np.mean(
+            window.reshape(-1, 3),
+            axis=0
+        )
+
+        background_mean = np.mean(
+            background.reshape(-1, 3),
+            axis=0
+        )
+
+        contrast_score = np.linalg.norm(
+            window_mean - background_mean
+        )
+
+        ##########################################################
+        # Final Score
+        ##########################################################
+
+        score = (
+            0.4 * brightness_score +
+            0.6 * contrast_score
+        )
+
+        return score
+
+    ##############################################################
+
+    def find_attention_window(
+            self,
+            image,
+            window_size=256,
+            step=64):
+
+        height, width = image.shape[:2]
+
+        best_score = -1
+
+        best_window = None
+
+        for y in range(
+                0,
+                height-window_size+1,
+                step):
+
+            for x in range(
+                    0,
+                    width-window_size+1,
+                    step):
+
+                score = self.visual_saliency(
+                    image,
                     x,
                     y,
-                    window_size,
                     window_size
                 )
 
-    return best_window
+                if score > best_score:
+
+                    best_score = score
+
+                    best_window = (
+                        x,
+                        y,
+                        window_size,
+                        window_size
+                    )
+
+        return best_window
