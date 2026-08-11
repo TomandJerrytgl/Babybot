@@ -1,4 +1,5 @@
 import cv2
+import os
 
 from attention import Attention
 
@@ -171,7 +172,7 @@ def resize_for_display(
 
 def main():
 
-    image_path = "test/test1.png"
+    image_path = "test/videoresult/left_test.jpg"
 
     print("1. Loading image...")
 
@@ -223,10 +224,16 @@ def main():
         result
     )
 
-    cv2.imshow(
-        "Babybot Top 5 Attention",
-        display_result
+    output_dir = "test/attentionresult"
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(
+        output_dir,
+        "attention_result.jpg"
     )
+
+    cv2.imwrite(output_path, display_result)
+
+    print(f"Attention result saved to: {output_path}")
 
     print()
     print("Press any key in the image window to close.")
