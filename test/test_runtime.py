@@ -6,8 +6,8 @@ from urllib.request import urlopen
 import cv2
 import numpy as np
 
-from attention import Attention
-from main import PreviewStore, encode_preview, make_request_handler
+from attention import Attention, TemplateTracker
+from main import EyePipeline, PreviewStore, RuntimeConfig, encode_preview, make_request_handler
 from observation import Observation, ObservationBuffer
 from http.server import ThreadingHTTPServer
 import threading
@@ -47,17 +47,98 @@ class AttentionTests(unittest.TestCase):
         self.assertTrue(result.candidates)
         self.assertIsNotNone(result.focus)
 
-    def test_expanded_region_stays_inside_image(self):
-        item = observation(1, 1.0)
-        attention = Attention(item, verbose=False)
-        x, y, width, height = attention.expanded_region((90, 60, 20, 20), (80, 100, 3), 3.0)
-        self.assertGreaterEqual(x, 0)
-        self.assertGreaterEqual(y, 0)
-        self.assertLessEqual(x + width, 100)
-        self.assertLessEqual(y + height, 80)
+    def test_new_object_is_selected_as_motion(self):
+        previous = np.zeros((200, 320, 3), dtype=np.uint8)
+        current = previous.copy()
+        current[60:160, 150:280] = (40, 80, 220)
+        item = Observation(1, time.time(), time.monotonic(), current, current.copy())
+        result = Attention(
+            item,
+            eye="left",
+            previous_image=previous,
+            verbose=False,
+        )
+        self.assertTrue(result.candidates)
+        self.assertEqual(result.focus_source, "motion")
+        x, y, width, height = result.focus
+        self.assertLessEqual(x, 150)
+        self.assertLessEqual(y, 60)
+        self.assertGreaterEqual(x + width, 280)
+        self.assertGreaterEqual(y + height, 160)
+
+    def test_stationary_focus_is_retained_temporarily(self):
+        image = np.zeros((120, 160, 3), dtype=np.uint8)
+        item = Observation(1, time.time(), time.monotonic(), image, image.copy())
+        result = Attention(
+            item,
+            previous_image=image.copy(),
+            previous_focus=(40, 30, 50, 50),
+            previous_focus_age=2,
+            verbose=False,
+        )
+        self.assertEqual(result.focus_source, "retained")
+        self.assertEqual(result.focus, (40, 30, 50, 50))
+
+    def test_global_brightness_change_is_not_motion(self):
+        previous = np.full((120, 160, 3), 40, dtype=np.uint8)
+        current = np.full((120, 160, 3), 90, dtype=np.uint8)
+        item = Observation(1, time.time(), time.monotonic(), current, current.copy())
+        result = Attention(item, previous_image=previous, verbose=False)
+        self.assertNotEqual(result.focus_source, "motion")
+
+
+class TemplateTrackerTests(unittest.TestCase):
+    @staticmethod
+    def textured_frame(x, y):
+        image = np.zeros((180, 280, 3), dtype=np.uint8)
+        patch = image[y:y + 40, x:x + 50]
+        patch[:] = (20, 120, 220)
+        cv2.line(patch, (0, 0), (49, 39), (255, 255, 255), 3)
+        cv2.circle(patch, (30, 15), 7, (0, 0, 0), -1)
+        return image
+
+    def test_relocates_template_near_previous_position(self):
+        source = self.textured_frame(80, 60)
+        current = self.textured_frame(94, 68)
+        tracker = TemplateTracker(source, (80, 60, 50, 40))
+        result = tracker.locate(current)
+        self.assertIsNotNone(result.window)
+        x, y, width, height = result.window
+        self.assertAlmostEqual(x, 94, delta=2)
+        self.assertAlmostEqual(y, 68, delta=2)
+        self.assertGreaterEqual(result.confidence, 0.75)
+        self.assertEqual(tracker.window, (x, y, width, height))
+
+    def test_failed_match_does_not_update_search_center(self):
+        source = self.textured_frame(80, 60)
+        tracker = TemplateTracker(source, (80, 60, 50, 40))
+        result = tracker.locate(np.zeros_like(source))
+        self.assertIsNone(result.window)
+        self.assertEqual(tracker.window, (80, 60, 50, 40))
+
+
+class EyePipelineTests(unittest.TestCase):
+    def test_three_failures_mark_target_lost(self):
+        source = TemplateTrackerTests.textured_frame(80, 60)
+        pipeline = EyePipeline("left", failure_limit=3)
+        pipeline.tracker = TemplateTracker(source, (80, 60, 50, 40))
+        blank = np.zeros_like(source)
+        pipeline.track(blank)
+        pipeline.track(blank)
+        self.assertIsNotNone(pipeline.tracker)
+        pipeline.track(blank)
+        self.assertIsNone(pipeline.tracker)
+        self.assertEqual(pipeline.state, "LOST")
+        self.assertEqual(pipeline.candidates(), [])
 
 
 class WebPreviewTests(unittest.TestCase):
+    def test_default_web_host_is_loopback_only(self):
+        self.assertEqual(RuntimeConfig().web_host, "127.0.0.1")
+
+    def test_default_preview_rate_is_fifteen_fps(self):
+        self.assertEqual(RuntimeConfig().preview_fps, 15.0)
+
     def setUp(self):
         self.store = PreviewStore()
         handler = make_request_handler(self.store)

@@ -1,577 +1,380 @@
+"""Low-latency motion-first visual attention for Babybot."""
+
+from __future__ import annotations
+
 import time
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
 
 
-class Attention:
-    """Pyramid-based visual attention with coarse-to-fine refinement."""
+Window = Tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class TrackingResult:
+    window: Optional[Window]
+    confidence: float
+    elapsed_time: float
+    search_scale: float
+
+
+class TemplateTracker:
+    """Relocate a fixed attention template near its last confirmed position."""
 
     def __init__(
-            self,
-            observation,
-            object=None,
-            eye="left",
-            previous_focus=None,
-            verbose=True):
-        self.observation = observation
-        self.object = object
-        if eye not in ("left", "right"):
-            raise ValueError("eye must be 'left' or 'right'")
-        self.eye = eye
-        self.previous_focus = previous_focus
-        self.verbose = verbose
-        self.candidates = []
-        self.elapsed_time = 0.0
+        self,
+        source_image,
+        window: Window,
+        high_confidence=0.75,
+        medium_confidence=0.60,
+        local_search_scale=3.0,
+        expanded_search_scale=5.0,
+        template_scales=(0.9, 1.0, 1.1),
+    ):
+        Attention._validate_image(source_image)
+        self.high_confidence = float(high_confidence)
+        self.medium_confidence = float(medium_confidence)
+        self.local_search_scale = float(local_search_scale)
+        self.expanded_search_scale = float(expanded_search_scale)
+        self.template_scales = tuple(float(scale) for scale in template_scales)
+        self.window = self.clip_window(window, source_image.shape)
+        x, y, width, height = self.window
+        self.template = source_image[y:y + height, x:x + width].copy()
+        if self.template.size == 0 or width < 4 or height < 4:
+            raise ValueError("Attention window does not contain a usable template")
 
-        if object is None:
-            self.focus = self.default_focus()
+    def locate(self, image) -> TrackingResult:
+        start = time.perf_counter()
+        best = self._search(image, self.local_search_scale)
+        search_scale = self.local_search_scale
+        if best[1] < self.high_confidence and best[1] >= self.medium_confidence:
+            best = self._search(image, self.expanded_search_scale)
+            search_scale = self.expanded_search_scale
+        window, confidence = best
+        if confidence >= self.high_confidence and window is not None:
+            self.window = window
         else:
-            self.focus = None
-
-    def default_focus(self):
-        image = getattr(self.observation, self.eye)
-        return self.find_attention_window(
-            image,
-            previous_focus=self.previous_focus,
+            window = None
+        return TrackingResult(
+            window=window,
+            confidence=float(confidence),
+            elapsed_time=time.perf_counter() - start,
+            search_scale=search_scale,
         )
 
-    def brightness_preference(self, brightness):
-        ideal = 170.0
-        sigma = 60.0
-        score = np.exp(
-            -((brightness - ideal) ** 2) / (2.0 * sigma ** 2)
-        )
-        return float(np.clip(score, 0.0, 1.0))
+    def _search(self, image, search_scale):
+        Attention._validate_image(image)
+        search_window = self.expanded_window(self.window, image.shape, search_scale)
+        sx, sy, sw, sh = search_window
+        search_image = image[sy:sy + sh, sx:sx + sw]
+        best_window = None
+        best_confidence = -1.0
 
-    def center_preference(self, x, y, width, height):
-        center_x = width / 2.0
-        center_y = height / 2.0
-        distance = np.sqrt(
-            (x - center_x) ** 2 + (y - center_y) ** 2
-        )
-        max_distance = np.sqrt(center_x ** 2 + center_y ** 2)
-
-        if max_distance == 0:
-            return 1.0
-
-        score = 1.0 - distance / max_distance
-        return float(np.clip(score, 0.0, 1.0))
-
-    def contrast_score(self, image, x, y, window_size):
-        image_height, image_width = image.shape[:2]
-        window = image[y:y + window_size, x:x + window_size]
-
-        if window.size == 0:
-            return 0.0
-
-        margin = window_size // 2
-        context_x1 = max(0, x - margin)
-        context_y1 = max(0, y - margin)
-        context_x2 = min(image_width, x + window_size + margin)
-        context_y2 = min(image_height, y + window_size + margin)
-        context = image[context_y1:context_y2, context_x1:context_x2]
-
-        if context.size == 0:
-            return 0.0
-
-        window_lab = cv2.cvtColor(
-            window, cv2.COLOR_BGR2LAB
-        ).astype(np.float32)
-        context_lab = cv2.cvtColor(
-            context, cv2.COLOR_BGR2LAB
-        ).astype(np.float32)
-
-        background_mask = np.ones(context.shape[:2], dtype=bool)
-        local_x = x - context_x1
-        local_y = y - context_y1
-        background_mask[
-            local_y:local_y + window_size,
-            local_x:local_x + window_size
-        ] = False
-        background_pixels = context_lab[background_mask]
-
-        if background_pixels.size == 0:
-            background_contrast = 0.0
-        else:
-            window_mean = np.mean(window_lab.reshape(-1, 3), axis=0)
-            background_mean = np.mean(background_pixels, axis=0)
-            color_distance = np.linalg.norm(window_mean - background_mean)
-            background_contrast = np.clip(
-                color_distance / 100.0, 0.0, 1.0
-            )
-
-        gray = cv2.cvtColor(window, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 60, 160)
-        edge_density = np.mean(edges > 0)
-        edge_score = np.clip(edge_density / 0.15, 0.0, 1.0)
-
-        score = 0.55 * background_contrast + 0.45 * edge_score
-        return float(np.clip(score, 0.0, 1.0))
-
-    def color_preference(self, window):
-        if window.size == 0:
-            return 0.0
-
-        hsv = cv2.cvtColor(window, cv2.COLOR_BGR2HSV)
-        saturation = hsv[:, :, 1].astype(np.float32) / 255.0
-        threshold = np.percentile(saturation, 70)
-        colorful_pixels = saturation[saturation >= threshold]
-
-        if colorful_pixels.size == 0:
-            return 0.0
-
-        score = np.mean(colorful_pixels)
-        return float(np.clip(score, 0.0, 1.0))
-
-    def visual_saliency(self, image, x, y, window_size):
-        image_height, image_width = image.shape[:2]
-        x = int(x)
-        y = int(y)
-        window_size = int(window_size)
-
-        if window_size <= 0 or x < 0 or y < 0:
-            return None
-        if x + window_size > image_width:
-            return None
-        if y + window_size > image_height:
-            return None
-
-        window = image[y:y + window_size, x:x + window_size]
-        if window.size == 0:
-            return None
-
-        window_float = window.astype(np.float32)
-        b = window_float[:, :, 0]
-        g = window_float[:, :, 1]
-        r = window_float[:, :, 2]
-        brightness = np.mean(0.114 * b + 0.587 * g + 0.299 * r)
-        brightness_score = self.brightness_preference(brightness)
-        contrast_score = self.contrast_score(image, x, y, window_size)
-        color_score = self.color_preference(window)
-
-        visual_score = (
-            0.15 * brightness_score
-            + 0.50 * contrast_score
-            + 0.35 * color_score
-        )
-        visual_score = float(np.clip(visual_score, 0.0, 1.0))
-
-        return (
-            brightness_score,
-            contrast_score,
-            color_score,
-            visual_score,
-        )
-
-    def evaluate_window(self, image, x, y, window_size, level):
-        image_height, image_width = image.shape[:2]
-        x = int(x)
-        y = int(y)
-        window_size = int(window_size)
-
-        if window_size < 8:
-            return None
-        if window_size > image_width or window_size > image_height:
-            return None
-
-        x = int(np.clip(x, 0, image_width - window_size))
-        y = int(np.clip(y, 0, image_height - window_size))
-        result = self.visual_saliency(image, x, y, window_size)
-
-        if result is None:
-            return None
-
-        brightness_score, contrast_score, color_score, visual_score = result
-        window_center_x = x + window_size / 2.0
-        window_center_y = y + window_size / 2.0
-        center_score = self.center_preference(
-            window_center_x,
-            window_center_y,
-            image_width,
-            image_height,
-        )
-        final_score = 0.95 * visual_score + 0.05 * center_score
-        final_score = float(np.clip(final_score, 0.0, 1.0))
-
-        return {
-            "window": (x, y, window_size, window_size),
-            "level": level,
-            "brightness": brightness_score,
-            "contrast": contrast_score,
-            "color": color_score,
-            "visual": visual_score,
-            "center": center_score,
-            "score": final_score,
-        }
-
-    def build_pyramid(self, image, pyramid_scale=0.5, coarse_min_side=240):
-        if image is None:
-            raise ValueError("Input image is None.")
-        if image.ndim != 3 or image.shape[2] != 3:
-            raise ValueError("Input image must be a BGR color image.")
-        if not 0.0 < pyramid_scale < 1.0:
-            raise ValueError("pyramid_scale must be between 0 and 1.")
-        if coarse_min_side < 8:
-            raise ValueError("coarse_min_side must be at least 8.")
-
-        pyramid = [image]
-        current_image = image
-
-        while min(current_image.shape[:2]) > coarse_min_side:
-            current_height, current_width = current_image.shape[:2]
-            new_width = max(1, int(current_width * pyramid_scale))
-            new_height = max(1, int(current_height * pyramid_scale))
-
-            if new_width == current_width and new_height == current_height:
-                break
-
-            current_image = cv2.resize(
-                current_image,
-                (new_width, new_height),
-                interpolation=cv2.INTER_AREA,
-            )
-            pyramid.append(current_image)
-
-        pyramid.reverse()
-        return pyramid
-
-    def generate_positions(self, image_length, window_size, step):
-        maximum_start = image_length - window_size
-        if maximum_start < 0:
-            return []
-
-        positions = list(range(0, maximum_start + 1, step))
-        if not positions:
-            positions = [0]
-        elif positions[-1] != maximum_start:
-            positions.append(maximum_start)
-        return positions
-
-    def coarse_search(self, image, level, max_candidates=30):
-        image_height, image_width = image.shape[:2]
-        minimum_side = min(image_height, image_width)
-        coarse_window_size = int(np.clip(minimum_side // 4, 32, 96))
-        coarse_window_size = min(
-            coarse_window_size, image_width, image_height
-        )
-        coarse_step = max(8, coarse_window_size // 2)
-
-        x_positions = self.generate_positions(
-            image_width, coarse_window_size, coarse_step
-        )
-        y_positions = self.generate_positions(
-            image_height, coarse_window_size, coarse_step
-        )
-        candidates = []
-
-        for y in y_positions:
-            for x in x_positions:
-                candidate = self.evaluate_window(
-                    image, x, y, coarse_window_size, level
+        for scale in self.template_scales:
+            width = max(4, int(round(self.template.shape[1] * scale)))
+            height = max(4, int(round(self.template.shape[0] * scale)))
+            if width > sw or height > sh:
+                continue
+            template = cv2.resize(self.template, (width, height), interpolation=cv2.INTER_AREA)
+            # SQDIFF_NORMED remains meaningful for low-texture templates.
+            response = cv2.matchTemplate(search_image, template, cv2.TM_SQDIFF_NORMED)
+            minimum, _maximum, location, _maximum_location = cv2.minMaxLoc(response)
+            confidence = float(np.clip(1.0 - minimum, 0.0, 1.0))
+            if confidence > best_confidence:
+                best_confidence = confidence
+                best_window = self.clip_window(
+                    (sx + location[0], sy + location[1], width, height),
+                    image.shape,
                 )
-                if candidate is not None:
-                    candidates.append(candidate)
+        return best_window, max(0.0, best_confidence)
 
-        # NMS is applied before candidates enter the next level.
-        return self.suppress_overlaps(
-            candidates,
-            overlap_threshold=0.65,
-            maximum_candidates=max_candidates,
-        )
-
-    def window_sizes_for_level(self, image_shape):
-        """Create level-local sizes; no box size is inherited."""
-        image_height, image_width = image_shape[:2]
-        minimum_side = min(image_height, image_width)
-
-        # Test several absolute fractions independently at every level.
-        raw_sizes = [
-            minimum_side / 8.0,
-            minimum_side / 4.0,
-            minimum_side / 2.0,
-        ]
-        sizes = []
-
-        for raw_size in raw_sizes:
-            candidate_size = int(round(raw_size))
-            candidate_size = int(
-                np.clip(candidate_size, 16, minimum_side)
-            )
-            if candidate_size not in sizes:
-                sizes.append(candidate_size)
-
-        return sizes
-
-    def refine_candidates(
-            self,
-            previous_candidates,
-            previous_shape,
-            current_image,
-            level,
-            max_candidates=30):
-        previous_height, previous_width = previous_shape[:2]
-        current_height, current_width = current_image.shape[:2]
-        scale_x = current_width / previous_width
-        scale_y = current_height / previous_height
-        candidate_sizes = self.window_sizes_for_level(current_image.shape)
-        refined_candidates = []
-        evaluated_windows = set()
-
-        for previous_candidate in previous_candidates:
-            previous_x, previous_y, previous_w, previous_h = (
-                previous_candidate["window"]
-            )
-
-            # Only the center is inherited from the previous level.
-            current_center_x = (
-                previous_x + previous_w / 2.0
-            ) * scale_x
-            current_center_y = (
-                previous_y + previous_h / 2.0
-            ) * scale_y
-
-            for candidate_size in candidate_sizes:
-                # A 7 x 7 grid centered on the mapped center. Adjacent grid
-                # points are separated by one eighth of the window size.
-                grid_step = max(2, int(round(candidate_size / 8.0)))
-
-                for grid_y in range(-3, 4):
-                    for grid_x in range(-3, 4):
-                        candidate_center_x = current_center_x + grid_x * grid_step
-                        candidate_center_y = current_center_y + grid_y * grid_step
-                        candidate_x = int(round(
-                            candidate_center_x - candidate_size / 2.0
-                        ))
-                        candidate_y = int(round(
-                            candidate_center_y - candidate_size / 2.0
-                        ))
-                        candidate_x = int(np.clip(
-                            candidate_x, 0, current_width - candidate_size
-                        ))
-                        candidate_y = int(np.clip(
-                            candidate_y, 0, current_height - candidate_size
-                        ))
-                        window_key = (
-                            candidate_x, candidate_y, candidate_size
-                        )
-
-                        if window_key in evaluated_windows:
-                            continue
-                        evaluated_windows.add(window_key)
-
-                        candidate = self.evaluate_window(
-                            current_image,
-                            candidate_x,
-                            candidate_y,
-                            candidate_size,
-                            level,
-                        )
-                        if candidate is not None:
-                            refined_candidates.append(candidate)
-
-        # Every refinement level performs NMS before propagation.
-        return self.suppress_overlaps(
-            refined_candidates,
-            overlap_threshold=0.65,
-            maximum_candidates=max_candidates,
-        )
-
-    def overlap_ratio(self, first_window, second_window):
-        first_x, first_y, first_w, first_h = first_window
-        second_x, second_y, second_w, second_h = second_window
-        intersection_x1 = max(first_x, second_x)
-        intersection_y1 = max(first_y, second_y)
-        intersection_x2 = min(first_x + first_w, second_x + second_w)
-        intersection_y2 = min(first_y + first_h, second_y + second_h)
-        intersection_width = max(0, intersection_x2 - intersection_x1)
-        intersection_height = max(0, intersection_y2 - intersection_y1)
-        intersection_area = intersection_width * intersection_height
-        smaller_area = min(first_w * first_h, second_w * second_h)
-
-        if smaller_area <= 0:
-            return 0.0
-        return float(intersection_area / smaller_area)
-
-    def suppress_overlaps(
-            self,
-            candidates,
-            overlap_threshold=0.70,
-            maximum_candidates=None):
-        sorted_candidates = sorted(
-            candidates, key=lambda item: item["score"], reverse=True
-        )
-        selected_candidates = []
-
-        for candidate in sorted_candidates:
-            if all(
-                self.overlap_ratio(
-                    candidate["window"], selected["window"]
-                ) < overlap_threshold
-                for selected in selected_candidates
-            ):
-                selected_candidates.append(candidate)
-
-                if (
-                    maximum_candidates is not None
-                    and len(selected_candidates) >= maximum_candidates
-                ):
-                    break
-
-        return selected_candidates
-
-    def candidate_limit_for_level(
-            self, level, number_of_levels, coarse_candidates, top_k):
-        """Reduce the computation budget as attention moves upward."""
-        if level <= 0:
-            return coarse_candidates
-
-        focus_limits = [15, 8]
-        refinement_index = level - 1
-
-        if level == number_of_levels - 1:
-            return max(top_k, 5)
-        if refinement_index < len(focus_limits):
-            return min(coarse_candidates, focus_limits[refinement_index])
-        return max(top_k, 5)
-
-    def find_attention_window(
-            self,
-            image,
-            previous_focus=None,
-            local_score_threshold=0.20,
-            top_k=5,
-            coarse_candidates=30,
-            pyramid_scale=0.5,
-            coarse_min_side=240):
-        """Search the previous focus neighborhood before scanning globally."""
-        start_time = time.perf_counter()
-        attempts = []
-
-        if previous_focus is not None:
-            for expansion in (1.5, 3.0):
-                region = self.expanded_region(
-                    previous_focus, image.shape, expansion
-                )
-                if region is not None and region not in attempts:
-                    attempts.append(region)
-
-        for region in attempts:
-            x, y, width, height = region
-            crop = image[y:y + height, x:x + width]
-            candidates, levels = self._search_pyramid(
-                crop,
-                top_k,
-                coarse_candidates,
-                pyramid_scale,
-                min(coarse_min_side, min(crop.shape[:2])),
-            )
-            candidates = self.offset_candidates(candidates, x, y)
-            if candidates and candidates[0]["score"] >= local_score_threshold:
-                self.candidates = candidates
-                self.elapsed_time = time.perf_counter() - start_time
-                if self.verbose:
-                    self.print_results(candidates, levels)
-                return candidates[0]["window"]
-
-        candidates, levels = self._search_pyramid(
-            image,
-            top_k,
-            coarse_candidates,
-            pyramid_scale,
-            coarse_min_side,
-        )
-        self.candidates = candidates
-        self.elapsed_time = time.perf_counter() - start_time
-        if self.verbose:
-            self.print_results(candidates, levels)
-
-        if not candidates:
-            return None
-        return candidates[0]["window"]
-
-    def _search_pyramid(
-            self,
-            image,
-            top_k,
-            coarse_candidates,
-            pyramid_scale,
-            coarse_min_side):
-        pyramid = self.build_pyramid(
-            image, pyramid_scale, coarse_min_side
-        )
-        candidates = self.coarse_search(
-            pyramid[0], level=0, max_candidates=coarse_candidates
-        )
-
-        for level in range(1, len(pyramid)):
-            if not candidates:
-                break
-
-            maximum_candidates = self.candidate_limit_for_level(
-                level,
-                len(pyramid),
-                coarse_candidates,
-                top_k,
-            )
-            candidates = self.refine_candidates(
-                previous_candidates=candidates,
-                previous_shape=pyramid[level - 1].shape,
-                current_image=pyramid[level],
-                level=level,
-                max_candidates=maximum_candidates,
-            )
-
-        candidates = self.suppress_overlaps(
-            candidates,
-            overlap_threshold=0.70,
-            maximum_candidates=top_k,
-        )
-        return candidates, len(pyramid)
-
-    def expanded_region(self, window, image_shape, expansion):
+    @staticmethod
+    def expanded_window(window, image_shape, scale):
         image_height, image_width = image_shape[:2]
         x, y, width, height = window
-        region_width = min(image_width, max(32, int(round(width * expansion))))
-        region_height = min(image_height, max(32, int(round(height * expansion))))
+        expanded_width = min(image_width, max(width, int(round(width * scale))))
+        expanded_height = min(image_height, max(height, int(round(height * scale))))
         center_x = x + width / 2.0
         center_y = y + height / 2.0
-        region_x = int(np.clip(round(center_x - region_width / 2.0), 0, image_width - region_width))
-        region_y = int(np.clip(round(center_y - region_height / 2.0), 0, image_height - region_height))
-        if region_width < 8 or region_height < 8:
-            return None
-        return region_x, region_y, region_width, region_height
+        expanded_x = int(np.clip(round(center_x - expanded_width / 2.0), 0, image_width - expanded_width))
+        expanded_y = int(np.clip(round(center_y - expanded_height / 2.0), 0, image_height - expanded_height))
+        return expanded_x, expanded_y, expanded_width, expanded_height
 
-    def offset_candidates(self, candidates, offset_x, offset_y):
-        translated = []
-        for candidate in candidates:
-            item = candidate.copy()
-            x, y, width, height = item["window"]
-            item["window"] = (
-                x + offset_x, y + offset_y, width, height
+    @staticmethod
+    def clip_window(window, image_shape):
+        image_height, image_width = image_shape[:2]
+        x, y, width, height = (int(value) for value in window)
+        x = int(np.clip(x, 0, max(0, image_width - 1)))
+        y = int(np.clip(y, 0, max(0, image_height - 1)))
+        width = int(np.clip(width, 1, image_width - x))
+        height = int(np.clip(height, 1, image_height - y))
+        return x, y, width, height
+
+
+class Attention:
+    """Prefer novel motion, briefly retain focus, then use static saliency."""
+
+    def __init__(
+        self,
+        observation,
+        object=None,
+        eye="left",
+        previous_focus: Optional[Window] = None,
+        previous_image=None,
+        previous_focus_age=0,
+        verbose=True,
+        analysis_width=320,
+        hold_observations=10,
+    ):
+        del object  # Kept in the signature for compatibility with older callers.
+        if eye not in ("left", "right"):
+            raise ValueError("eye must be 'left' or 'right'")
+        self.observation = observation
+        self.eye = eye
+        self.previous_focus = previous_focus
+        self.previous_image = previous_image
+        self.previous_focus_age = int(previous_focus_age)
+        self.verbose = verbose
+        self.analysis_width = int(analysis_width)
+        self.hold_observations = int(hold_observations)
+        self.candidates = []
+        self.elapsed_time = 0.0
+        self.focus_source = "none"
+
+        image = getattr(observation, eye)
+        self.focus = self.find_attention_window(image)
+
+    def find_attention_window(self, image):
+        start = time.perf_counter()
+        self._validate_image(image)
+        candidates = []
+
+        if self.previous_image is not None:
+            candidates = self.motion_candidates(image, self.previous_image)
+
+        if candidates:
+            self.focus_source = "motion"
+        elif (
+            self.previous_focus is not None
+            and self.previous_focus_age < self.hold_observations
+        ):
+            candidates = [self.retained_candidate(image, self.previous_focus)]
+            self.focus_source = "retained"
+        else:
+            candidates = self.static_candidates(image)
+            self.focus_source = "static" if candidates else "none"
+
+        self.candidates = candidates[:5]
+        self.elapsed_time = time.perf_counter() - start
+        if self.verbose:
+            self.print_results()
+        return self.candidates[0]["window"] if self.candidates else None
+
+    def motion_candidates(self, current, previous):
+        if previous.shape[:2] != current.shape[:2]:
+            return []
+        current_small, scale_x, scale_y = self.analysis_image(current)
+        previous_small = cv2.resize(
+            previous,
+            (current_small.shape[1], current_small.shape[0]),
+            interpolation=cv2.INTER_AREA,
+        )
+        current_gray = cv2.cvtColor(current_small, cv2.COLOR_BGR2GRAY)
+        previous_gray = cv2.cvtColor(previous_small, cv2.COLOR_BGR2GRAY)
+
+        # Removing the median signed difference suppresses global exposure shifts.
+        signed = current_gray.astype(np.int16) - previous_gray.astype(np.int16)
+        signed -= int(np.median(signed))
+        difference = np.abs(signed).astype(np.uint8)
+        difference = cv2.GaussianBlur(difference, (5, 5), 0)
+        noise_level = float(np.median(difference))
+        threshold = int(np.clip(noise_level + 18.0, 18.0, 45.0))
+        mask = np.where(difference >= threshold, 255, 0).astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        changed_fraction = float(np.mean(mask > 0))
+        # A near-global change is normally exposure adjustment or camera movement.
+        if changed_fraction < 0.002 or changed_fraction > 0.55:
+            return []
+
+        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask)
+        analysis_area = mask.shape[0] * mask.shape[1]
+        minimum_area = max(40, int(analysis_area * 0.0025))
+        candidates = []
+        for label in range(1, count):
+            x, y, width, height, area = stats[label]
+            if area < minimum_area:
+                continue
+            window = self.map_and_pad_window(
+                (int(x), int(y), int(width), int(height)),
+                scale_x,
+                scale_y,
+                current.shape,
             )
-            translated.append(item)
-        return translated
+            region_mask = labels[y:y + height, x:x + width] == label
+            region_difference = difference[y:y + height, x:x + width]
+            intensity = float(np.mean(region_difference[region_mask]) / 255.0)
+            area_score = float(np.clip(area / (analysis_area * 0.12), 0.0, 1.0))
+            center = self.center_preference(window, current.shape)
+            score = float(np.clip(0.50 * intensity + 0.40 * area_score + 0.10 * center, 0.0, 1.0))
+            candidates.append(
+                self.make_candidate(current, window, score, motion=intensity, source="motion")
+            )
 
-    def print_results(self, candidates, pyramid_levels):
+        return self.suppress_overlaps(candidates, maximum_candidates=5)
+
+    def static_candidates(self, image):
+        """Cheap low-resolution fallback; motion candidates always take priority."""
+        small, scale_x, scale_y = self.analysis_image(image)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        saturation = hsv[:, :, 1].astype(np.float32) / 255.0
+        local_mean = cv2.GaussianBlur(gray, (31, 31), 0)
+        local_contrast = cv2.absdiff(gray, local_mean)
+        edges = cv2.Canny((gray * 255).astype(np.uint8), 60, 160).astype(np.float32) / 255.0
+        saliency = 0.45 * local_contrast + 0.30 * saturation + 0.25 * edges
+        saliency = cv2.GaussianBlur(saliency, (21, 21), 0)
+
+        height, width = gray.shape
+        window_size = max(24, int(min(height, width) * 0.20))
+        step = max(12, window_size // 2)
+        candidates = []
+        for y in range(0, max(1, height - window_size + 1), step):
+            for x in range(0, max(1, width - window_size + 1), step):
+                patch = saliency[y:y + window_size, x:x + window_size]
+                if patch.size == 0:
+                    continue
+                window = self.map_window(
+                    (x, y, window_size, window_size),
+                    scale_x,
+                    scale_y,
+                    image.shape,
+                )
+                visual = float(np.clip(np.mean(patch) * 4.0, 0.0, 1.0))
+                center = self.center_preference(window, image.shape)
+                score = 0.90 * visual + 0.10 * center
+                candidates.append(
+                    self.make_candidate(image, window, score, source="static")
+                )
+        return self.suppress_overlaps(candidates, maximum_candidates=5)
+
+    def retained_candidate(self, image, window):
+        window = self.clip_window(window, image.shape)
+        # A small decay exposes stale focus without causing immediate flicker.
+        decay = max(0.0, 1.0 - self.previous_focus_age / max(1, self.hold_observations))
+        score = 0.35 + 0.35 * decay
+        return self.make_candidate(image, window, score, source="retained")
+
+    def analysis_image(self, image):
+        height, width = image.shape[:2]
+        target_width = min(width, self.analysis_width)
+        target_height = max(1, int(round(height * target_width / width)))
+        if target_width == width:
+            return image, 1.0, 1.0
+        small = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_AREA)
+        return small, width / target_width, height / target_height
+
+    def map_window(self, window, scale_x, scale_y, image_shape):
+        x, y, width, height = window
+        mapped = (
+            int(round(x * scale_x)),
+            int(round(y * scale_y)),
+            max(1, int(round(width * scale_x))),
+            max(1, int(round(height * scale_y))),
+        )
+        return self.clip_window(mapped, image_shape)
+
+    def map_and_pad_window(self, window, scale_x, scale_y, image_shape):
+        x, y, width, height = self.map_window(window, scale_x, scale_y, image_shape)
+        padding_x = max(8, int(width * 0.20))
+        padding_y = max(8, int(height * 0.20))
+        return self.clip_window(
+            (x - padding_x, y - padding_y, width + 2 * padding_x, height + 2 * padding_y),
+            image_shape,
+        )
+
+    def clip_window(self, window, image_shape):
+        image_height, image_width = image_shape[:2]
+        x, y, width, height = (int(value) for value in window)
+        x = int(np.clip(x, 0, max(0, image_width - 1)))
+        y = int(np.clip(y, 0, max(0, image_height - 1)))
+        width = int(np.clip(width, 1, image_width - x))
+        height = int(np.clip(height, 1, image_height - y))
+        return x, y, width, height
+
+    def center_preference(self, window, image_shape):
+        image_height, image_width = image_shape[:2]
+        x, y, width, height = window
+        dx = (x + width / 2.0 - image_width / 2.0) / max(1.0, image_width / 2.0)
+        dy = (y + height / 2.0 - image_height / 2.0) / max(1.0, image_height / 2.0)
+        return float(np.clip(1.0 - np.hypot(dx, dy) / np.sqrt(2.0), 0.0, 1.0))
+
+    def make_candidate(self, image, window, score, motion=0.0, source="static"):
+        x, y, width, height = self.clip_window(window, image.shape)
+        patch = image[y:y + height, x:x + width]
+        if patch.size:
+            hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+            brightness = float(np.mean(hsv[:, :, 2]) / 255.0)
+            color = float(np.mean(hsv[:, :, 1]) / 255.0)
+            gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+            contrast = float(np.std(gray) / 128.0)
+        else:
+            brightness = color = contrast = 0.0
+        center = self.center_preference((x, y, width, height), image.shape)
+        return {
+            "window": (x, y, width, height),
+            "level": 0,
+            "brightness": float(np.clip(brightness, 0.0, 1.0)),
+            "contrast": float(np.clip(contrast, 0.0, 1.0)),
+            "color": float(np.clip(color, 0.0, 1.0)),
+            "visual": float(np.clip(score, 0.0, 1.0)),
+            "center": center,
+            "motion": float(np.clip(motion, 0.0, 1.0)),
+            "source": source,
+            "score": float(np.clip(score, 0.0, 1.0)),
+        }
+
+    def suppress_overlaps(self, candidates, overlap_threshold=0.65, maximum_candidates=5):
+        selected = []
+        for candidate in sorted(candidates, key=lambda item: item["score"], reverse=True):
+            if all(
+                self.overlap_ratio(candidate["window"], chosen["window"]) < overlap_threshold
+                for chosen in selected
+            ):
+                selected.append(candidate)
+                if len(selected) >= maximum_candidates:
+                    break
+        return selected
+
+    @staticmethod
+    def overlap_ratio(first, second):
+        ax, ay, aw, ah = first
+        bx, by, bw, bh = second
+        left, top = max(ax, bx), max(ay, by)
+        right, bottom = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+        intersection = max(0, right - left) * max(0, bottom - top)
+        smaller = min(aw * ah, bw * bh)
+        return float(intersection / smaller) if smaller else 0.0
+
+    @staticmethod
+    def _validate_image(image):
+        if image is None:
+            raise ValueError("Input image is None")
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError("Input image must be a BGR color image")
+
+    def print_results(self):
         print("---------------------------------------")
-        print(f"Pyramid Levels : {pyramid_levels}")
-        print(f"Attention Time : {self.elapsed_time * 1000:.2f} ms")
-
-        if self.elapsed_time > 0:
-            print(f"Estimated FPS  : {1.0 / self.elapsed_time:.2f}")
-
-        print(f"Candidates     : {len(candidates)}")
-
-        for rank, candidate in enumerate(candidates, start=1):
-            print("---------------------------------------")
-            print(f"Rank         : {rank}")
-            print(f"Window       : {candidate['window']}")
-            print(f"Brightness   : {candidate['brightness']:.3f}")
-            print(f"Contrast     : {candidate['contrast']:.3f}")
-            print(f"Color        : {candidate['color']:.3f}")
-            print(f"Visual Score : {candidate['visual']:.3f}")
-            print(f"Center Score : {candidate['center']:.3f}")
-            print(f"Final Score  : {candidate['score']:.3f}")
-
+        print(f"Attention Source: {self.focus_source}")
+        print(f"Attention Time  : {self.elapsed_time * 1000:.2f} ms")
+        for rank, candidate in enumerate(self.candidates, start=1):
+            print(
+                f"#{rank} {candidate['window']} score={candidate['score']:.3f} "
+                f"source={candidate['source']}"
+            )
         print("---------------------------------------")

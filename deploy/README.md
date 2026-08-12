@@ -27,5 +27,18 @@ Stop the service gracefully with:
 sudo systemctl stop babybot.service
 ```
 
-From a computer on the same Wi-Fi network, open
-`http://JETSON_IP_ADDRESS:8080`.
+The preview server listens only on Jetson's loopback interface. It is not
+directly reachable through the Jetson Wi-Fi address.
+
+With a VS Code Remote SSH connection, open the **Ports** panel, forward remote
+port `8080`, and then open `http://127.0.0.1:8080` on the computer.
+
+Alternatively, create the tunnel manually from the computer and keep the SSH
+session open:
+
+```powershell
+ssh -L 8080:127.0.0.1:8080 Tom@JETSON_IP_ADDRESS
+```
+
+Then open `http://127.0.0.1:8080`. Closing the tunnel removes computer access
+to the preview.

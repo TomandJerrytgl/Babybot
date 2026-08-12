@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import html
 import logging
 import signal
@@ -17,7 +17,7 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
-from attention import Attention
+from attention import Attention, TemplateTracker, TrackingResult
 from observation import Observation, ObservationBuffer
 
 
@@ -36,9 +36,11 @@ class RuntimeConfig:
     observation_interval: float = 0.5
     retention_seconds: float = 20.0
     retry_delay: float = 0.1
-    web_host: str = "0.0.0.0"
+    web_host: str = "127.0.0.1"
     web_port: int = 8080
     jpeg_quality: int = 80
+    preview_fps: float = 15.0
+    tracking_failure_limit: int = 3
 
 
 class PreviewStore:
@@ -111,7 +113,7 @@ def make_request_handler(previews: PreviewStore):
                     "<section><h2>Left eye</h2><img id='left'></section>"
                     "<section><h2>Right eye</h2><img id='right'></section></div>"
                     "<script>function refresh(){const t=Date.now();left.src='/frame/left.jpg?t='+t;"
-                    "right.src='/frame/right.jpg?t='+t}setInterval(refresh,500);refresh()</script>"
+                    "right.src='/frame/right.jpg?t='+t}setInterval(refresh,67);refresh()</script>"
                     "</body></html>"
                 ).encode("utf-8")
                 self.send_response(HTTPStatus.OK)
@@ -144,6 +146,96 @@ def make_request_handler(previews: PreviewStore):
     return PreviewHandler
 
 
+class EyePipeline:
+    """Independent discovery and tracking state for one eye."""
+
+    def __init__(self, eye: str, failure_limit: int):
+        self.eye = eye
+        self.failure_limit = failure_limit
+        self.state = "DISCOVERING"
+        self.future: Optional[Future] = None
+        self.source_observation: Optional[Observation] = None
+        self.tracker: Optional[TemplateTracker] = None
+        self.candidate = None
+        self.failure_count = 0
+        self.previous_discovery_image = None
+
+    def submit_discovery(self, executor, observation: Observation) -> bool:
+        if self.future is not None or self.tracker is not None:
+            return False
+        self.state = "DISCOVERING"
+        self.source_observation = observation
+        self.candidate = None
+        self.future = executor.submit(
+            Attention,
+            observation,
+            eye=self.eye,
+            previous_image=self.previous_discovery_image,
+            verbose=False,
+        )
+        self.previous_discovery_image = getattr(observation, self.eye)
+        return True
+
+    def collect_discovery(self) -> bool:
+        if self.future is None or not self.future.done():
+            return False
+        future = self.future
+        observation = self.source_observation
+        self.future = None
+        self.source_observation = None
+        try:
+            attention = future.result()
+            if attention.focus is None or observation is None:
+                self.state = "LOST"
+                return False
+            source_image = getattr(observation, self.eye)
+            self.tracker = TemplateTracker(source_image, attention.focus)
+            self.state = "RELOCATING"
+            LOGGER.info(
+                "%s discovery complete (observation=%d, age=%.0fms, source=%s, %.0fms)",
+                self.eye, observation.observation_id,
+                (time.monotonic() - observation.monotonic_timestamp) * 1000,
+                attention.focus_source, attention.elapsed_time * 1000,
+            )
+            return True
+        except Exception:
+            LOGGER.exception("%s attention discovery failed", self.eye)
+            self.state = "LOST"
+            return False
+
+    def track(self, image) -> Optional[TrackingResult]:
+        if self.tracker is None:
+            self.candidate = None
+            return None
+        previous_state = self.state
+        result = self.tracker.locate(image)
+        if result.window is not None:
+            self.failure_count = 0
+            self.state = "TRACKING"
+            self.candidate = {
+                "window": result.window,
+                "score": result.confidence,
+                "source": "tracking",
+            }
+            if previous_state == "RELOCATING":
+                LOGGER.info(
+                    "%s relocation confirmed (confidence=%.3f, %.0fms)",
+                    self.eye, result.confidence, result.elapsed_time * 1000,
+                )
+        else:
+            self.failure_count += 1
+            self.candidate = None
+            if self.failure_count >= self.failure_limit:
+                self.tracker = None
+                self.failure_count = 0
+                self.state = "LOST"
+                LOGGER.info("%s tracking lost after %d failed frames", self.eye, self.failure_limit)
+        return result
+
+    def candidates(self):
+        return [self.candidate] if self.candidate is not None else []
+
+
 class BabybotRuntime:
     def __init__(self, config: RuntimeConfig):
         self.config = config
@@ -154,8 +246,8 @@ class BabybotRuntime:
         self.right_camera = None
         self.web_server: Optional[ThreadingHTTPServer] = None
         self.web_thread: Optional[threading.Thread] = None
-        self.left_focus: Optional[Window] = None
-        self.right_focus: Optional[Window] = None
+        self.left_pipeline = EyePipeline("left", config.tracking_failure_limit)
+        self.right_pipeline = EyePipeline("right", config.tracking_failure_limit)
         self.attention_pool = ThreadPoolExecutor(
             max_workers=2,
             thread_name_prefix="attention",
@@ -166,7 +258,7 @@ class BabybotRuntime:
         try:
             self._open_cameras_until_ready()
             self._warm_up()
-            self._observation_loop()
+            self._capture_loop()
         finally:
             self.shutdown()
 
@@ -216,14 +308,12 @@ class BabybotRuntime:
                 self.stop_event.wait(self.config.retry_delay)
         LOGGER.info("Camera warm-up complete")
 
-    def _observation_loop(self) -> None:
+    def _capture_loop(self) -> None:
         observation_id = 0
-        next_capture = time.monotonic()
+        next_observation = time.monotonic()
+        next_preview = time.monotonic()
         last_failure_log = 0.0
         while not self.stop_event.is_set():
-            wait_time = next_capture - time.monotonic()
-            if wait_time > 0 and self.stop_event.wait(wait_time):
-                break
             pair = self._capture_pair()
             if pair is None:
                 now = time.monotonic()
@@ -233,44 +323,70 @@ class BabybotRuntime:
                 self.stop_event.wait(self.config.retry_delay)
                 continue
 
-            captured_monotonic = time.monotonic()
             left, right = pair
-            observation = Observation(
-                observation_id=observation_id,
-                timestamp=time.time(),
-                monotonic_timestamp=captured_monotonic,
-                left=left,
-                right=right,
-            )
-            self.observations.append(observation)
-            left_future = self.attention_pool.submit(
-                Attention, observation, None, "left", self.left_focus, False
-            )
-            right_future = self.attention_pool.submit(
-                Attention, observation, None, "right", self.right_focus, False
-            )
-            left_attention = left_future.result()
-            right_attention = right_future.result()
-            self.left_focus = left_attention.focus
-            self.right_focus = right_attention.focus
-            self.previews.update(
-                left, right, left_attention.candidates, right_attention.candidates,
-                observation_id, self.config.jpeg_quality,
-            )
-            LOGGER.info(
-                "Observation %d complete (buffer=%d, left=%.0fms, right=%.0fms)",
-                observation_id, len(self.observations), left_attention.elapsed_time * 1000,
-                right_attention.elapsed_time * 1000,
-            )
-            observation_id += 1
-            next_capture = max(next_capture + self.config.observation_interval, time.monotonic())
+            now = time.monotonic()
+
+            if now >= next_observation:
+                observation = Observation(
+                    observation_id=observation_id,
+                    timestamp=time.time(),
+                    monotonic_timestamp=now,
+                    left=left.copy(),
+                    right=right.copy(),
+                )
+                self.observations.append(observation)
+                left_submitted = self.left_pipeline.submit_discovery(self.attention_pool, observation)
+                right_submitted = self.right_pipeline.submit_discovery(self.attention_pool, observation)
+                LOGGER.info(
+                    "Observation %d stored (buffer=%d, discovery left=%s right=%s)",
+                    observation_id, len(self.observations), left_submitted, right_submitted,
+                )
+                observation_id += 1
+                next_observation = max(
+                    next_observation + self.config.observation_interval,
+                    now,
+                )
+
+            # Polling is non-blocking: capture never waits for attention futures.
+            self.left_pipeline.collect_discovery()
+            self.right_pipeline.collect_discovery()
+
+            if now >= next_preview:
+                left_result = self.left_pipeline.track(left)
+                right_result = self.right_pipeline.track(right)
+                self.previews.update(
+                    left,
+                    right,
+                    self.left_pipeline.candidates(),
+                    self.right_pipeline.candidates(),
+                    observation_id - 1,
+                    self.config.jpeg_quality,
+                )
+                LOGGER.debug(
+                    "Tracking left=%s right=%s",
+                    self._tracking_summary(self.left_pipeline, left_result),
+                    self._tracking_summary(self.right_pipeline, right_result),
+                )
+                next_preview = max(next_preview + 1.0 / self.config.preview_fps, now)
+
+    @staticmethod
+    def _tracking_summary(pipeline, result):
+        if result is None:
+            return pipeline.state
+        return (
+            f"{pipeline.state}/{result.confidence:.3f}/"
+            f"{result.elapsed_time * 1000:.0f}ms/fail={pipeline.failure_count}"
+        )
 
     def _start_web_server(self) -> None:
         handler = make_request_handler(self.previews)
         self.web_server = ThreadingHTTPServer((self.config.web_host, self.config.web_port), handler)
         self.web_thread = threading.Thread(target=self.web_server.serve_forever, name="preview-web", daemon=True)
         self.web_thread.start()
-        LOGGER.info("Preview page: http://<jetson-ip>:%d", self.config.web_port)
+        LOGGER.info(
+            "Preview listens locally at http://127.0.0.1:%d; use an SSH port forward to view it",
+            self.config.web_port,
+        )
 
     def _release_cameras(self) -> None:
         for camera in (self.left_camera, self.right_camera):
