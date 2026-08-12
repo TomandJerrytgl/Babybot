@@ -7,9 +7,20 @@ import numpy as np
 class Attention:
     """Pyramid-based visual attention with coarse-to-fine refinement."""
 
-    def __init__(self, observation, object=None):
+    def __init__(
+            self,
+            observation,
+            object=None,
+            eye="left",
+            previous_focus=None,
+            verbose=True):
         self.observation = observation
         self.object = object
+        if eye not in ("left", "right"):
+            raise ValueError("eye must be 'left' or 'right'")
+        self.eye = eye
+        self.previous_focus = previous_focus
+        self.verbose = verbose
         self.candidates = []
         self.elapsed_time = 0.0
 
@@ -19,7 +30,11 @@ class Attention:
             self.focus = None
 
     def default_focus(self):
-        return self.find_attention_window(self.observation.left)
+        image = getattr(self.observation, self.eye)
+        return self.find_attention_window(
+            image,
+            previous_focus=self.previous_focus,
+        )
 
     def brightness_preference(self, brightness):
         ideal = 170.0
@@ -423,11 +438,65 @@ class Attention:
     def find_attention_window(
             self,
             image,
+            previous_focus=None,
+            local_score_threshold=0.20,
             top_k=5,
             coarse_candidates=30,
             pyramid_scale=0.5,
             coarse_min_side=240):
+        """Search the previous focus neighborhood before scanning globally."""
         start_time = time.perf_counter()
+        attempts = []
+
+        if previous_focus is not None:
+            for expansion in (1.5, 3.0):
+                region = self.expanded_region(
+                    previous_focus, image.shape, expansion
+                )
+                if region is not None and region not in attempts:
+                    attempts.append(region)
+
+        for region in attempts:
+            x, y, width, height = region
+            crop = image[y:y + height, x:x + width]
+            candidates, levels = self._search_pyramid(
+                crop,
+                top_k,
+                coarse_candidates,
+                pyramid_scale,
+                min(coarse_min_side, min(crop.shape[:2])),
+            )
+            candidates = self.offset_candidates(candidates, x, y)
+            if candidates and candidates[0]["score"] >= local_score_threshold:
+                self.candidates = candidates
+                self.elapsed_time = time.perf_counter() - start_time
+                if self.verbose:
+                    self.print_results(candidates, levels)
+                return candidates[0]["window"]
+
+        candidates, levels = self._search_pyramid(
+            image,
+            top_k,
+            coarse_candidates,
+            pyramid_scale,
+            coarse_min_side,
+        )
+        self.candidates = candidates
+        self.elapsed_time = time.perf_counter() - start_time
+        if self.verbose:
+            self.print_results(candidates, levels)
+
+        if not candidates:
+            return None
+        return candidates[0]["window"]
+
+    def _search_pyramid(
+            self,
+            image,
+            top_k,
+            coarse_candidates,
+            pyramid_scale,
+            coarse_min_side):
         pyramid = self.build_pyramid(
             image, pyramid_scale, coarse_min_side
         )
@@ -458,15 +527,31 @@ class Attention:
             overlap_threshold=0.70,
             maximum_candidates=top_k,
         )
-        self.candidates = candidates
-        self.elapsed_time = time.perf_counter() - start_time
-        self.print_results(candidates, len(pyramid))
+        return candidates, len(pyramid)
 
-        if not candidates:
+    def expanded_region(self, window, image_shape, expansion):
+        image_height, image_width = image_shape[:2]
+        x, y, width, height = window
+        region_width = min(image_width, max(32, int(round(width * expansion))))
+        region_height = min(image_height, max(32, int(round(height * expansion))))
+        center_x = x + width / 2.0
+        center_y = y + height / 2.0
+        region_x = int(np.clip(round(center_x - region_width / 2.0), 0, image_width - region_width))
+        region_y = int(np.clip(round(center_y - region_height / 2.0), 0, image_height - region_height))
+        if region_width < 8 or region_height < 8:
             return None
+        return region_x, region_y, region_width, region_height
 
-        # Backward compatibility: focus remains the best window tuple.
-        return candidates[0]["window"]
+    def offset_candidates(self, candidates, offset_x, offset_y):
+        translated = []
+        for candidate in candidates:
+            item = candidate.copy()
+            x, y, width, height = item["window"]
+            item["window"] = (
+                x + offset_x, y + offset_y, width, height
+            )
+            translated.append(item)
+        return translated
 
     def print_results(self, candidates, pyramid_levels):
         print("---------------------------------------")

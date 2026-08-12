@@ -1,0 +1,18 @@
+[Unit]
+Description=Babybot vision runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=babybot
+Group=video
+WorkingDirectory=/opt/babybot
+ExecStart=/usr/bin/python3 /opt/babybot/main.py --left-camera 0 --right-camera 2 --port 8080
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
