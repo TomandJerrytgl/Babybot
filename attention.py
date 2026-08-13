@@ -30,6 +30,9 @@ class VisualSignature:
     visual_score: float
     aspect_ratio: float
     area_fraction: float
+    hsv_histogram: np.ndarray
+    gray_structure: np.ndarray
+    edge_structure: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,7 @@ class AttentionReference:
     timestamp: float
     window: Window
     signature: VisualSignature
+    attention_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -127,6 +131,10 @@ def visual_signature(image, window: Window) -> VisualSignature:
         1.0,
     ))
     image_area = image.shape[0] * image.shape[1]
+    histogram = cv2.calcHist([hsv], [0, 1], None, [12, 8], [0, 180, 0, 256])
+    cv2.normalize(histogram, histogram, alpha=1.0, norm_type=cv2.NORM_L1)
+    gray_structure = cv2.resize(gray, (16, 16), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    edge_structure = cv2.resize(edges, (16, 16), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
     return VisualSignature(
         brightness=brightness,
         contrast=contrast,
@@ -135,6 +143,9 @@ def visual_signature(image, window: Window) -> VisualSignature:
         visual_score=visual_score,
         aspect_ratio=float(width / max(1, height)),
         area_fraction=float(width * height / max(1, image_area)),
+        hsv_histogram=histogram.flatten(),
+        gray_structure=gray_structure,
+        edge_structure=edge_structure,
     )
 
 
@@ -142,14 +153,26 @@ def signature_similarity(reference: VisualSignature, candidate: VisualSignature)
     def closeness(first, second, scale):
         return float(np.clip(1.0 - abs(first - second) / scale, 0.0, 1.0))
 
+    histogram_distance = cv2.compareHist(
+        reference.hsv_histogram.astype(np.float32),
+        candidate.hsv_histogram.astype(np.float32),
+        cv2.HISTCMP_BHATTACHARYYA,
+    )
+    histogram_similarity = float(np.clip(1.0 - histogram_distance, 0.0, 1.0))
+    gray_difference = float(np.mean(np.abs(reference.gray_structure - candidate.gray_structure)))
+    gray_similarity = float(np.clip(1.0 - gray_difference / 0.35, 0.0, 1.0))
+    edge_difference = float(np.mean(np.abs(reference.edge_structure - candidate.edge_structure)))
+    edge_similarity = float(np.clip(1.0 - edge_difference / 0.35, 0.0, 1.0))
     values = (
-        (0.15, closeness(reference.brightness, candidate.brightness, 0.35)),
-        (0.20, closeness(reference.contrast, candidate.contrast, 0.35)),
-        (0.20, closeness(reference.color, candidate.color, 0.40)),
-        (0.20, closeness(reference.edge_density, candidate.edge_density, 0.18)),
-        (0.20, closeness(reference.visual_score, candidate.visual_score, 0.35)),
-        (0.025, closeness(reference.aspect_ratio, candidate.aspect_ratio, 0.50)),
-        (0.025, closeness(reference.area_fraction, candidate.area_fraction, 0.08)),
+        (0.35, histogram_similarity),
+        (0.18, gray_similarity),
+        (0.12, edge_similarity),
+        (0.07, closeness(reference.brightness, candidate.brightness, 0.30)),
+        (0.08, closeness(reference.contrast, candidate.contrast, 0.30)),
+        (0.07, closeness(reference.color, candidate.color, 0.35)),
+        (0.07, closeness(reference.edge_density, candidate.edge_density, 0.15)),
+        (0.04, closeness(reference.aspect_ratio, candidate.aspect_ratio, 0.45)),
+        (0.02, closeness(reference.area_fraction, candidate.area_fraction, 0.06)),
     )
     return float(np.clip(sum(weight * score for weight, score in values), 0.0, 1.0))
 
@@ -164,6 +187,7 @@ def make_attention_references(observation, eye, attention):
             timestamp=observation.timestamp,
             window=window,
             signature=visual_signature(image, window),
+            attention_score=float(candidate["score"]),
         ))
     return references
 
@@ -304,8 +328,11 @@ class Attention:
         motion_mask, motion_strength, motion_windows = self.motion_evidence(
             small, self.previous_image
         )
-        windows = self.static_windows(small.shape)
-        windows.extend(motion_windows)
+        contour_windows = self.static_contour_windows(small)
+        windows = list(motion_windows)
+        windows.extend(contour_windows)
+        if len(windows) < 8:
+            windows.extend(self.static_windows(small.shape))
         windows = list(dict.fromkeys(windows))
         candidates = []
 
@@ -363,25 +390,56 @@ class Attention:
         difference = cv2.GaussianBlur(np.abs(signed).astype(np.uint8), (5, 5), 0)
         threshold = int(np.clip(float(np.median(difference)) + 18.0, 18.0, 45.0))
         raw_mask = np.where(difference >= threshold, 255, 0).astype(np.uint8)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        join_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, close_kernel, iterations=2)
+        raw_mask = cv2.dilate(raw_mask, join_kernel, iterations=1)
         changed_fraction = float(np.mean(raw_mask > 0))
         if changed_fraction > 0.55:
             return empty, np.zeros_like(empty, dtype=np.float32), []
 
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(raw_mask)
         image_area = raw_mask.size
         accepted = np.zeros_like(raw_mask)
         windows = []
-        for label in range(1, count):
-            x, y, width, height, area = stats[label]
-            area_fraction = area / image_area
+        contours, _ = cv2.findContours(raw_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            hull = cv2.convexHull(contour)
+            hull_area = cv2.contourArea(hull)
+            area_fraction = hull_area / image_area
             if area_fraction < 0.005:
                 continue
-            accepted[labels == label] = 255
+            cv2.drawContours(accepted, [hull], -1, 255, thickness=-1)
+            x, y, width, height = cv2.boundingRect(hull)
             windows.append((int(x), int(y), int(width), int(height)))
         strength = difference.astype(np.float32) / 255.0
         return accepted, strength, windows
+
+    def static_contour_windows(self, image):
+        """Generate object-shaped boxes from color boundaries and closed edges."""
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blurred_lab = cv2.GaussianBlur(lab, (21, 21), 0)
+        color_difference = np.linalg.norm(
+            lab.astype(np.float32) - blurred_lab.astype(np.float32), axis=2
+        )
+        color_edges = np.where(color_difference >= 12.0, 255, 0).astype(np.uint8)
+        canny = cv2.Canny(gray, 50, 140)
+        boundary = cv2.bitwise_or(color_edges, canny)
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        boundary = cv2.morphologyEx(boundary, cv2.MORPH_CLOSE, close_kernel, iterations=2)
+        contours, _ = cv2.findContours(boundary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        image_area = image.shape[0] * image.shape[1]
+        windows = []
+        for contour in contours:
+            hull = cv2.convexHull(contour)
+            area_fraction = cv2.contourArea(hull) / image_area
+            if area_fraction < 0.005 or area_fraction > 0.40:
+                continue
+            x, y, width, height = cv2.boundingRect(hull)
+            if width < 8 or height < 8:
+                continue
+            windows.append((int(x), int(y), int(width), int(height)))
+        return windows
 
     def evaluate_candidate(self, image, window, motion_mask, motion_strength):
         x, y, width, height = self.clip_window(window, image.shape)

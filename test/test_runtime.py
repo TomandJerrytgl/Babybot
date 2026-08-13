@@ -200,6 +200,26 @@ class CandidateGenerationTests(unittest.TestCase):
         large_motion_center_bonus = 0.20 * center * (1.0 - 1.0)
         self.assertGreater(no_motion_center_bonus, large_motion_center_bonus)
 
+    def test_nearby_finger_shapes_merge_before_area_filter(self):
+        attention = Attention.__new__(Attention)
+        previous = np.zeros((200, 320, 3), dtype=np.uint8)
+        current = previous.copy()
+        cv2.rectangle(current, (130, 95), (185, 155), (60, 120, 220), -1)
+        for x in (132, 145, 158, 171):
+            cv2.rectangle(current, (x, 55), (x + 8, 105), (60, 120, 220), -1)
+        mask, _strength, windows = attention.motion_evidence(current, previous)
+        self.assertTrue(windows)
+        self.assertGreater(np.mean(mask > 0), 0.005)
+        hand_windows = [window for window in windows if window[1] <= 60 and window[1] + window[3] >= 150]
+        self.assertTrue(hand_windows)
+
+    def test_static_contours_create_object_candidate(self):
+        attention = Attention.__new__(Attention)
+        image = np.full((200, 320, 3), 180, dtype=np.uint8)
+        cv2.rectangle(image, (100, 60), (220, 150), (20, 80, 220), -1)
+        windows = attention.static_contour_windows(image)
+        self.assertTrue(any(width != height for _x, _y, width, height in windows))
+
 
 class WebPreviewTests(unittest.TestCase):
     def test_default_web_host_is_loopback_only(self):

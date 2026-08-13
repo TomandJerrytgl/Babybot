@@ -87,9 +87,11 @@ def encode_preview(image: np.ndarray, candidates: list, quality: int) -> bytes:
         x, y, width, height = candidate["window"]
         color = colors[(rank - 1) % len(colors)]
         cv2.rectangle(annotated, (x, y), (x + width, y + height), color, 4 if rank == 1 else 2)
+        attention_score = candidate.get("attention_score", candidate["score"])
+        validation_score = candidate.get("validation_score", candidate["score"])
         cv2.putText(
             annotated,
-            f"#{rank} {candidate['score']:.3f}",
+            f"#{candidate.get('rank', rank)} A:{attention_score:.2f} V:{validation_score:.2f}",
             (x, max(22, y - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
@@ -163,9 +165,10 @@ class EyePipeline:
         self.source_observation: Optional[Observation] = None
         self.validators = []
         self.current_candidates = []
-        self.previous_attention_image = None
 
-    def submit_attention(self, executor, observation: Observation) -> bool:
+    def submit_attention(
+            self, executor, observation: Observation,
+            previous_observation: Optional[Observation]) -> bool:
         if self.future is not None:
             return False
         self.source_observation = observation
@@ -173,10 +176,12 @@ class EyePipeline:
             Attention,
             observation,
             eye=self.eye,
-            previous_image=self.previous_attention_image,
+            previous_image=(
+                getattr(previous_observation, self.eye)
+                if previous_observation is not None else None
+            ),
             verbose=False,
         )
-        self.previous_attention_image = getattr(observation, self.eye)
         return True
 
     def collect_attention(self) -> bool:
@@ -218,6 +223,8 @@ class EyePipeline:
                 candidates.append({
                     "window": result.window,
                     "score": result.similarity,
+                    "attention_score": validator.reference.attention_score,
+                    "validation_score": result.similarity,
                     "source": "validated",
                     "rank": rank,
                 })
@@ -313,6 +320,7 @@ class BabybotRuntime:
 
     def _capture_loop(self) -> None:
         observation_id = 0
+        previous_observation = None
         next_observation = time.monotonic()
         next_attention = time.monotonic()
         last_failure_log = 0.0
@@ -344,10 +352,10 @@ class BabybotRuntime:
                 left_submitted = right_submitted = False
                 if attention_due:
                     left_submitted = self.left_pipeline.submit_attention(
-                        self.attention_pool, observation
+                        self.attention_pool, observation, previous_observation
                     )
                     right_submitted = self.right_pipeline.submit_attention(
-                        self.attention_pool, observation
+                        self.attention_pool, observation, previous_observation
                     )
                     next_attention = max(
                         next_attention + self.config.attention_interval,
@@ -376,6 +384,7 @@ class BabybotRuntime:
                     self._validation_summary(right_result),
                 )
                 observation_id += 1
+                previous_observation = observation
                 next_observation = max(
                     next_observation + self.config.observation_interval,
                     now,
