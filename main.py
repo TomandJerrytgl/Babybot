@@ -20,8 +20,7 @@ import numpy as np
 from attention import (
     Attention,
     AttentionValidator,
-    ValidationResult,
-    make_attention_reference,
+    make_attention_references,
 )
 from observation import Observation, ObservationBuffer
 
@@ -45,6 +44,8 @@ class RuntimeConfig:
     web_host: str = "127.0.0.1"
     web_port: int = 8080
     jpeg_quality: int = 80
+    observation_jpeg_quality: int = 85
+    analysis_width: int = 320
     preview_fps: float = 10.0
 
 
@@ -160,8 +161,8 @@ class EyePipeline:
         self.eye = eye
         self.future: Optional[Future] = None
         self.source_observation: Optional[Observation] = None
-        self.validator: Optional[AttentionValidator] = None
-        self.candidate = None
+        self.validators = []
+        self.current_candidates = []
         self.previous_attention_image = None
 
     def submit_attention(self, executor, observation: Observation) -> bool:
@@ -189,13 +190,13 @@ class EyePipeline:
             attention = future.result()
             if observation is None:
                 return False
-            reference = make_attention_reference(observation, self.eye, attention)
-            if reference is None:
-                self.validator = None
-                self.candidate = None
+            references = make_attention_references(observation, self.eye, attention)
+            if not references:
+                self.validators = []
+                self.current_candidates = []
                 return False
-            self.validator = AttentionValidator(reference)
-            self.candidate = None
+            self.validators = [AttentionValidator(reference) for reference in references]
+            self.current_candidates = []
             LOGGER.info(
                 "%s attention replaced (observation=%d, age=%.0fms, source=%s, %.0fms)",
                 self.eye, observation.observation_id,
@@ -207,23 +208,34 @@ class EyePipeline:
             LOGGER.exception("%s attention calculation failed", self.eye)
             return False
 
-    def validate(self, image) -> Optional[ValidationResult]:
-        if self.validator is None:
-            self.candidate = None
-            return None
-        result = self.validator.validate(image)
-        if result.window is None:
-            self.candidate = None
-        else:
-            self.candidate = {
-                "window": result.window,
-                "score": result.similarity,
-                "source": "validated",
-            }
-        return result
+    def validate(self, image):
+        results = []
+        candidates = []
+        for rank, validator in enumerate(self.validators, start=1):
+            result = validator.validate(image)
+            results.append(result)
+            if result.window is not None:
+                candidates.append({
+                    "window": result.window,
+                    "score": result.similarity,
+                    "source": "validated",
+                    "rank": rank,
+                })
+        self.current_candidates = self._filter_candidates(candidates)
+        return results
+
+    @staticmethod
+    def _filter_candidates(candidates):
+        selected = []
+        for candidate in sorted(candidates, key=lambda item: item["rank"]):
+            if all(Attention.windows_compatible(
+                candidate["window"], chosen["window"]
+            ) for chosen in selected):
+                selected.append(candidate)
+        return selected[:5]
 
     def candidates(self):
-        return [self.candidate] if self.candidate is not None else []
+        return list(self.current_candidates)
 
 
 class BabybotRuntime:
@@ -318,12 +330,14 @@ class BabybotRuntime:
             now = time.monotonic()
 
             if now >= next_observation:
-                observation = Observation(
+                observation = Observation.from_frames(
                     observation_id=observation_id,
                     timestamp=time.time(),
                     monotonic_timestamp=now,
-                    left=left.copy(),
-                    right=right.copy(),
+                    left=left,
+                    right=right,
+                    jpeg_quality=self.config.observation_jpeg_quality,
+                    analysis_width=self.config.analysis_width,
                 )
                 self.observations.append(observation)
                 attention_due = now >= next_attention
@@ -344,13 +358,13 @@ class BabybotRuntime:
                 # polling call waits unless its future already reports done.
                 self.left_pipeline.collect_attention()
                 self.right_pipeline.collect_attention()
-                left_result = self.left_pipeline.validate(left)
-                right_result = self.right_pipeline.validate(right)
+                left_result = self.left_pipeline.validate(observation.left)
+                right_result = self.right_pipeline.validate(observation.right)
                 self.previews.update(
                     left,
                     right,
-                    self.left_pipeline.candidates(),
-                    self.right_pipeline.candidates(),
+                    self._map_candidates(observation, self.left_pipeline.candidates()),
+                    self._map_candidates(observation, self.right_pipeline.candidates()),
                     observation_id,
                     self.config.jpeg_quality,
                 )
@@ -369,10 +383,20 @@ class BabybotRuntime:
 
     @staticmethod
     def _validation_summary(result):
-        if result is None:
+        if not result:
             return "no-reference"
-        state = "shown" if result.window is not None else "hidden"
-        return f"{state}/{result.similarity:.3f}/{result.elapsed_time * 1000:.0f}ms"
+        shown = sum(item.window is not None for item in result)
+        elapsed = sum(item.elapsed_time for item in result) * 1000
+        return f"shown={shown}/{len(result)}/{elapsed:.0f}ms"
+
+    @staticmethod
+    def _map_candidates(observation, candidates):
+        mapped = []
+        for candidate in candidates:
+            item = candidate.copy()
+            item["window"] = observation.map_window_to_full(candidate["window"])
+            mapped.append(item)
+        return mapped
 
     def _start_web_server(self) -> None:
         handler = make_request_handler(self.previews)

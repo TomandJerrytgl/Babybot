@@ -17,6 +17,14 @@ def make_observation(identifier, monotonic_timestamp):
 
 
 class ObservationBufferTests(unittest.TestCase):
+    def test_compressed_observation_keeps_full_resolution_jpeg_and_small_analysis(self):
+        frame = np.full((80, 128, 3), 120, dtype=np.uint8)
+        item = Observation.from_frames(1, 1.0, 1.0, frame, frame, jpeg_quality=85, analysis_width=32)
+        self.assertEqual(item.left.shape[:2], (20, 32))
+        self.assertTrue(item.left_jpeg.startswith(b"\xff\xd8"))
+        self.assertEqual(item.decode("left").shape, frame.shape)
+        self.assertEqual(item.map_window_to_full((8, 5, 16, 10)), (32, 20, 64, 40))
+
     def test_discards_items_older_than_retention_window(self):
         buffer = ObservationBuffer(retention_seconds=20.0)
         buffer.append(make_observation(1, 10.0))

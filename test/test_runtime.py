@@ -143,10 +143,19 @@ class EyePipelineTests(unittest.TestCase):
             signature=visual_signature(source, (80, 60, 50, 40)),
         )
         pipeline = EyePipeline("left")
-        pipeline.validator = AttentionValidator(reference, similarity_threshold=0.95)
-        pipeline.candidate = {"window": reference.window, "score": 1.0}
+        pipeline.validators = [AttentionValidator(reference, similarity_threshold=0.95)]
+        pipeline.current_candidates = [{"window": reference.window, "score": 1.0}]
         pipeline.validate(np.full_like(source, 255))
         self.assertEqual(pipeline.candidates(), [])
+
+    def test_partial_overlap_is_removed_but_containment_is_allowed(self):
+        candidates = [
+            {"window": (10, 10, 100, 100), "score": 0.9, "rank": 1},
+            {"window": (30, 30, 20, 20), "score": 0.8, "rank": 2},
+            {"window": (90, 90, 50, 50), "score": 0.7, "rank": 3},
+        ]
+        selected = EyePipeline._filter_candidates(candidates)
+        self.assertEqual([item["rank"] for item in selected], [1, 2])
 
 
 class AttentionValidatorTests(unittest.TestCase):
@@ -175,6 +184,23 @@ class AttentionValidatorTests(unittest.TestCase):
         self.assertEqual(validator.last_confirmed_window, second.window)
 
 
+class CandidateGenerationTests(unittest.TestCase):
+    def test_static_windows_include_non_square_aspects(self):
+        attention = Attention.__new__(Attention)
+        windows = attention.static_windows((200, 320, 3))
+        self.assertTrue(any(width != height for _x, _y, width, height in windows))
+
+    def test_full_containment_allowed_but_partial_overlap_rejected(self):
+        self.assertTrue(Attention.windows_compatible((0, 0, 100, 100), (20, 20, 20, 20)))
+        self.assertFalse(Attention.windows_compatible((0, 0, 100, 100), (80, 80, 50, 50)))
+
+    def test_large_motion_reduces_center_bonus(self):
+        center = 1.0
+        no_motion_center_bonus = 0.20 * center * (1.0 - 0.0)
+        large_motion_center_bonus = 0.20 * center * (1.0 - 1.0)
+        self.assertGreater(no_motion_center_bonus, large_motion_center_bonus)
+
+
 class WebPreviewTests(unittest.TestCase):
     def test_default_web_host_is_loopback_only(self):
         self.assertEqual(RuntimeConfig().web_host, "127.0.0.1")
@@ -184,6 +210,8 @@ class WebPreviewTests(unittest.TestCase):
         self.assertEqual(config.observation_interval, 0.1)
         self.assertEqual(config.attention_interval, 0.5)
         self.assertEqual(config.preview_fps, 10.0)
+        self.assertEqual(config.observation_jpeg_quality, 85)
+        self.assertEqual(config.analysis_width, 320)
 
     def setUp(self):
         self.store = PreviewStore()

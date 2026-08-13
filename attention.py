@@ -154,17 +154,23 @@ def signature_similarity(reference: VisualSignature, candidate: VisualSignature)
     return float(np.clip(sum(weight * score for weight, score in values), 0.0, 1.0))
 
 
-def make_attention_reference(observation, eye, attention) -> Optional[AttentionReference]:
-    if attention.focus is None:
-        return None
+def make_attention_references(observation, eye, attention):
     image = getattr(observation, eye)
-    window = TemplateTracker.clip_window(attention.focus, image.shape)
-    return AttentionReference(
-        observation_id=observation.observation_id,
-        timestamp=observation.timestamp,
-        window=window,
-        signature=visual_signature(image, window),
-    )
+    references = []
+    for candidate in attention.candidates[:5]:
+        window = TemplateTracker.clip_window(candidate["window"], image.shape)
+        references.append(AttentionReference(
+            observation_id=observation.observation_id,
+            timestamp=observation.timestamp,
+            window=window,
+            signature=visual_signature(image, window),
+        ))
+    return references
+
+
+def make_attention_reference(observation, eye, attention) -> Optional[AttentionReference]:
+    references = make_attention_references(observation, eye, attention)
+    return references[0] if references else None
 
 
 class TemplateTracker:
@@ -330,11 +336,15 @@ class Attention:
         minimum_side = min(height, width)
         windows = []
         for fraction in (0.15, 0.25, 0.40):
-            size = max(24, int(round(minimum_side * fraction)))
-            step = max(12, size // 2)
-            for y in range(0, max(1, height - size + 1), step):
-                for x in range(0, max(1, width - size + 1), step):
-                    windows.append((x, y, size, size))
+            base = max(24, int(round(minimum_side * fraction)))
+            for aspect_ratio in (1.0, 4/3, 3/2, 2.0, 3/4, 2/3, 0.5):
+                window_width = min(width, max(12, int(round(base * np.sqrt(aspect_ratio)))))
+                window_height = min(height, max(12, int(round(base / np.sqrt(aspect_ratio)))))
+                step_x = max(12, window_width // 2)
+                step_y = max(12, window_height // 2)
+                for y in range(0, max(1, height - window_height + 1), step_y):
+                    for x in range(0, max(1, width - window_width + 1), step_x):
+                        windows.append((x, y, window_width, window_height))
         return windows
 
     def motion_evidence(self, current_small, previous_image):
@@ -445,7 +455,9 @@ class Attention:
             strength = 0.0
         motion_value = float(np.clip(size_response * (0.5 + 0.5 * strength), 0.0, 1.0))
         center = self.center_preference((x, y, width, height), image.shape)
-        score = float(np.clip(0.60 * base_score + 0.20 * motion_value + 0.20 * center, 0.0, 1.0))
+        motion_bonus = 0.35 * motion_value
+        center_bonus = 0.20 * center * (1.0 - size_response)
+        score = float(np.clip(0.65 * base_score + motion_bonus + center_bonus, 0.0, 1.0))
         source = "mixed" if motion_value > 0 else "static"
         return self.make_candidate(
             image, (x, y, width, height), score, motion=motion_value,
@@ -531,14 +543,45 @@ class Attention:
     def suppress_overlaps(self, candidates, overlap_threshold=0.65, maximum_candidates=5):
         selected = []
         for candidate in sorted(candidates, key=lambda item: item["score"], reverse=True):
-            if all(
-                self.overlap_ratio(candidate["window"], chosen["window"]) < overlap_threshold
-                for chosen in selected
-            ):
+            if all(self.windows_compatible(
+                candidate["window"], chosen["window"], overlap_threshold
+            ) for chosen in selected):
                 selected.append(candidate)
                 if len(selected) >= maximum_candidates:
                     break
         return selected
+
+    @classmethod
+    def windows_compatible(cls, first, second, overlap_threshold=0.65):
+        if cls.nearly_identical(first, second):
+            return False
+        if cls.contains(first, second) or cls.contains(second, first):
+            return True
+        return cls.intersection_area(first, second) == 0
+
+    @staticmethod
+    def intersection_area(first, second):
+        ax, ay, aw, ah = first
+        bx, by, bw, bh = second
+        return max(0, min(ax + aw, bx + bw) - max(ax, bx)) * max(
+            0, min(ay + ah, by + bh) - max(ay, by)
+        )
+
+    @classmethod
+    def contains(cls, outer, inner, tolerance=2):
+        ox, oy, ow, oh = outer
+        ix, iy, iw, ih = inner
+        return (
+            ix >= ox - tolerance and iy >= oy - tolerance
+            and ix + iw <= ox + ow + tolerance
+            and iy + ih <= oy + oh + tolerance
+        )
+
+    @classmethod
+    def nearly_identical(cls, first, second):
+        intersection = cls.intersection_area(first, second)
+        union = first[2] * first[3] + second[2] * second[3] - intersection
+        return union > 0 and intersection / union >= 0.90
 
     @staticmethod
     def overlap_ratio(first, second):
