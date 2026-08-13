@@ -21,6 +21,152 @@ class TrackingResult:
     search_scale: float
 
 
+@dataclass(frozen=True)
+class VisualSignature:
+    brightness: float
+    contrast: float
+    color: float
+    edge_density: float
+    visual_score: float
+    aspect_ratio: float
+    area_fraction: float
+
+
+@dataclass(frozen=True)
+class AttentionReference:
+    observation_id: int
+    timestamp: float
+    window: Window
+    signature: VisualSignature
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    window: Optional[Window]
+    similarity: float
+    elapsed_time: float
+
+
+class AttentionValidator:
+    """Confirm an attention reference using visual features near its last box."""
+
+    def __init__(
+        self,
+        reference: AttentionReference,
+        similarity_threshold=0.78,
+        search_scale=3.0,
+        offsets=(-0.5, 0.0, 0.5),
+        size_scales=(0.9, 1.0, 1.1),
+    ):
+        self.reference = reference
+        self.similarity_threshold = float(similarity_threshold)
+        self.search_scale = float(search_scale)
+        self.offsets = tuple(float(value) for value in offsets)
+        self.size_scales = tuple(float(value) for value in size_scales)
+        self.last_confirmed_window = reference.window
+
+    def replace_reference(self, reference: AttentionReference) -> None:
+        self.reference = reference
+        self.last_confirmed_window = reference.window
+
+    def validate(self, image) -> ValidationResult:
+        start = time.perf_counter()
+        Attention._validate_image(image)
+        search = TemplateTracker.expanded_window(
+            self.last_confirmed_window, image.shape, self.search_scale
+        )
+        sx, sy, sw, sh = search
+        base_x, base_y, base_width, base_height = self.last_confirmed_window
+        center_x = base_x + base_width / 2.0
+        center_y = base_y + base_height / 2.0
+        best_window = None
+        best_similarity = -1.0
+
+        for size_scale in self.size_scales:
+            width = max(8, int(round(base_width * size_scale)))
+            height = max(8, int(round(base_height * size_scale)))
+            if width > sw or height > sh:
+                continue
+            for offset_y in self.offsets:
+                for offset_x in self.offsets:
+                    candidate_x = int(round(center_x + offset_x * base_width - width / 2.0))
+                    candidate_y = int(round(center_y + offset_y * base_height - height / 2.0))
+                    candidate_x = int(np.clip(candidate_x, sx, sx + sw - width))
+                    candidate_y = int(np.clip(candidate_y, sy, sy + sh - height))
+                    window = (candidate_x, candidate_y, width, height)
+                    signature = visual_signature(image, window)
+                    similarity = signature_similarity(self.reference.signature, signature)
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+                        best_window = window
+
+        confirmed = best_window if best_similarity >= self.similarity_threshold else None
+        if confirmed is not None:
+            self.last_confirmed_window = confirmed
+        return ValidationResult(
+            window=confirmed,
+            similarity=max(0.0, float(best_similarity)),
+            elapsed_time=time.perf_counter() - start,
+        )
+
+
+def visual_signature(image, window: Window) -> VisualSignature:
+    x, y, width, height = TemplateTracker.clip_window(window, image.shape)
+    patch = image[y:y + height, x:x + width]
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+    brightness = float(np.mean(hsv[:, :, 2]) / 255.0)
+    color = float(np.mean(hsv[:, :, 1]) / 255.0)
+    contrast = float(np.clip(np.std(gray) / 128.0, 0.0, 1.0))
+    edges = cv2.Canny(gray, 60, 160)
+    edge_density = float(np.mean(edges > 0))
+    visual_score = float(np.clip(
+        0.20 * brightness + 0.30 * contrast + 0.25 * color
+        + 0.25 * np.clip(edge_density / 0.15, 0.0, 1.0),
+        0.0,
+        1.0,
+    ))
+    image_area = image.shape[0] * image.shape[1]
+    return VisualSignature(
+        brightness=brightness,
+        contrast=contrast,
+        color=color,
+        edge_density=edge_density,
+        visual_score=visual_score,
+        aspect_ratio=float(width / max(1, height)),
+        area_fraction=float(width * height / max(1, image_area)),
+    )
+
+
+def signature_similarity(reference: VisualSignature, candidate: VisualSignature) -> float:
+    def closeness(first, second, scale):
+        return float(np.clip(1.0 - abs(first - second) / scale, 0.0, 1.0))
+
+    values = (
+        (0.15, closeness(reference.brightness, candidate.brightness, 0.35)),
+        (0.20, closeness(reference.contrast, candidate.contrast, 0.35)),
+        (0.20, closeness(reference.color, candidate.color, 0.40)),
+        (0.20, closeness(reference.edge_density, candidate.edge_density, 0.18)),
+        (0.20, closeness(reference.visual_score, candidate.visual_score, 0.35)),
+        (0.025, closeness(reference.aspect_ratio, candidate.aspect_ratio, 0.50)),
+        (0.025, closeness(reference.area_fraction, candidate.area_fraction, 0.08)),
+    )
+    return float(np.clip(sum(weight * score for weight, score in values), 0.0, 1.0))
+
+
+def make_attention_reference(observation, eye, attention) -> Optional[AttentionReference]:
+    if attention.focus is None:
+        return None
+    image = getattr(observation, eye)
+    window = TemplateTracker.clip_window(attention.focus, image.shape)
+    return AttentionReference(
+        observation_id=observation.observation_id,
+        timestamp=observation.timestamp,
+        window=window,
+        signature=visual_signature(image, window),
+    )
+
+
 class TemplateTracker:
     """Relocate a fixed attention template near its last confirmed position."""
 

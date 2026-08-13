@@ -6,7 +6,13 @@ from urllib.request import urlopen
 import cv2
 import numpy as np
 
-from attention import Attention, TemplateTracker
+from attention import (
+    Attention,
+    AttentionReference,
+    AttentionValidator,
+    TemplateTracker,
+    visual_signature,
+)
 from main import EyePipeline, PreviewStore, RuntimeConfig, encode_preview, make_request_handler
 from observation import Observation, ObservationBuffer
 from http.server import ThreadingHTTPServer
@@ -118,26 +124,56 @@ class TemplateTrackerTests(unittest.TestCase):
 
 
 class EyePipelineTests(unittest.TestCase):
-    def test_three_failures_mark_target_lost(self):
+    def test_failed_validation_hides_candidate_immediately(self):
         source = TemplateTrackerTests.textured_frame(80, 60)
-        pipeline = EyePipeline("left", failure_limit=3)
-        pipeline.tracker = TemplateTracker(source, (80, 60, 50, 40))
-        blank = np.zeros_like(source)
-        pipeline.track(blank)
-        pipeline.track(blank)
-        self.assertIsNotNone(pipeline.tracker)
-        pipeline.track(blank)
-        self.assertIsNone(pipeline.tracker)
-        self.assertEqual(pipeline.state, "LOST")
+        reference = AttentionReference(
+            observation_id=1,
+            timestamp=1.0,
+            window=(80, 60, 50, 40),
+            signature=visual_signature(source, (80, 60, 50, 40)),
+        )
+        pipeline = EyePipeline("left")
+        pipeline.validator = AttentionValidator(reference, similarity_threshold=0.95)
+        pipeline.candidate = {"window": reference.window, "score": 1.0}
+        pipeline.validate(np.full_like(source, 255))
         self.assertEqual(pipeline.candidates(), [])
+
+
+class AttentionValidatorTests(unittest.TestCase):
+    def test_success_updates_next_search_center(self):
+        source = TemplateTrackerTests.textured_frame(80, 60)
+        moved = TemplateTrackerTests.textured_frame(105, 70)
+        reference = AttentionReference(
+            observation_id=1,
+            timestamp=1.0,
+            window=(80, 60, 50, 40),
+            signature=visual_signature(source, (80, 60, 50, 40)),
+        )
+        validator = AttentionValidator(reference, similarity_threshold=0.70)
+        result = validator.validate(moved)
+        self.assertIsNotNone(result.window)
+        self.assertEqual(validator.last_confirmed_window, result.window)
+
+    def test_reference_replacement_resets_search_center(self):
+        image = TemplateTrackerTests.textured_frame(80, 60)
+        first = AttentionReference(1, 1.0, (80, 60, 50, 40), visual_signature(image, (80, 60, 50, 40)))
+        second = AttentionReference(2, 2.0, (20, 30, 50, 40), visual_signature(image, (80, 60, 50, 40)))
+        validator = AttentionValidator(first)
+        validator.last_confirmed_window = (100, 70, 50, 40)
+        validator.replace_reference(second)
+        self.assertEqual(validator.reference.observation_id, 2)
+        self.assertEqual(validator.last_confirmed_window, second.window)
 
 
 class WebPreviewTests(unittest.TestCase):
     def test_default_web_host_is_loopback_only(self):
         self.assertEqual(RuntimeConfig().web_host, "127.0.0.1")
 
-    def test_default_preview_rate_is_fifteen_fps(self):
-        self.assertEqual(RuntimeConfig().preview_fps, 15.0)
+    def test_default_processing_rates(self):
+        config = RuntimeConfig()
+        self.assertEqual(config.observation_interval, 0.1)
+        self.assertEqual(config.attention_interval, 0.5)
+        self.assertEqual(config.preview_fps, 10.0)
 
     def setUp(self):
         self.store = PreviewStore()

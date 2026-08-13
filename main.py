@@ -17,7 +17,12 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
-from attention import Attention, TemplateTracker, TrackingResult
+from attention import (
+    Attention,
+    AttentionValidator,
+    ValidationResult,
+    make_attention_reference,
+)
 from observation import Observation, ObservationBuffer
 
 
@@ -33,14 +38,14 @@ class RuntimeConfig:
     height: int = 800
     camera_fps: int = 60
     warmup_seconds: float = 6.0
-    observation_interval: float = 0.5
+    observation_interval: float = 0.1
+    attention_interval: float = 0.5
     retention_seconds: float = 20.0
     retry_delay: float = 0.1
     web_host: str = "127.0.0.1"
     web_port: int = 8080
     jpeg_quality: int = 80
-    preview_fps: float = 15.0
-    tracking_failure_limit: int = 3
+    preview_fps: float = 10.0
 
 
 class PreviewStore:
@@ -112,8 +117,10 @@ def make_request_handler(previews: PreviewStore):
                     "<body><h1>Babybot Attention</h1><div class='eyes'>"
                     "<section><h2>Left eye</h2><img id='left'></section>"
                     "<section><h2>Right eye</h2><img id='right'></section></div>"
-                    "<script>function refresh(){const t=Date.now();left.src='/frame/left.jpg?t='+t;"
-                    "right.src='/frame/right.jpg?t='+t}setInterval(refresh,67);refresh()</script>"
+                    "<script>function refresh(){let pending=2;const done=()=>{if(--pending===0)"
+                    "setTimeout(refresh,100)};left.onload=left.onerror=done;right.onload=right.onerror=done;"
+                    "const t=Date.now();left.src='/frame/left.jpg?t='+t;right.src='/frame/right.jpg?t='+t}"
+                    "refresh()</script>"
                     "</body></html>"
                 ).encode("utf-8")
                 self.send_response(HTTPStatus.OK)
@@ -147,36 +154,31 @@ def make_request_handler(previews: PreviewStore):
 
 
 class EyePipeline:
-    """Independent discovery and tracking state for one eye."""
+    """Independent 2 Hz attention reference and 10 Hz validation for one eye."""
 
-    def __init__(self, eye: str, failure_limit: int):
+    def __init__(self, eye: str):
         self.eye = eye
-        self.failure_limit = failure_limit
-        self.state = "DISCOVERING"
         self.future: Optional[Future] = None
         self.source_observation: Optional[Observation] = None
-        self.tracker: Optional[TemplateTracker] = None
+        self.validator: Optional[AttentionValidator] = None
         self.candidate = None
-        self.failure_count = 0
-        self.previous_discovery_image = None
+        self.previous_attention_image = None
 
-    def submit_discovery(self, executor, observation: Observation) -> bool:
-        if self.future is not None or self.tracker is not None:
+    def submit_attention(self, executor, observation: Observation) -> bool:
+        if self.future is not None:
             return False
-        self.state = "DISCOVERING"
         self.source_observation = observation
-        self.candidate = None
         self.future = executor.submit(
             Attention,
             observation,
             eye=self.eye,
-            previous_image=self.previous_discovery_image,
+            previous_image=self.previous_attention_image,
             verbose=False,
         )
-        self.previous_discovery_image = getattr(observation, self.eye)
+        self.previous_attention_image = getattr(observation, self.eye)
         return True
 
-    def collect_discovery(self) -> bool:
+    def collect_attention(self) -> bool:
         if self.future is None or not self.future.done():
             return False
         future = self.future
@@ -185,51 +187,39 @@ class EyePipeline:
         self.source_observation = None
         try:
             attention = future.result()
-            if attention.focus is None or observation is None:
-                self.state = "LOST"
+            if observation is None:
                 return False
-            source_image = getattr(observation, self.eye)
-            self.tracker = TemplateTracker(source_image, attention.focus)
-            self.state = "RELOCATING"
+            reference = make_attention_reference(observation, self.eye, attention)
+            if reference is None:
+                self.validator = None
+                self.candidate = None
+                return False
+            self.validator = AttentionValidator(reference)
+            self.candidate = None
             LOGGER.info(
-                "%s discovery complete (observation=%d, age=%.0fms, source=%s, %.0fms)",
+                "%s attention replaced (observation=%d, age=%.0fms, source=%s, %.0fms)",
                 self.eye, observation.observation_id,
                 (time.monotonic() - observation.monotonic_timestamp) * 1000,
                 attention.focus_source, attention.elapsed_time * 1000,
             )
             return True
         except Exception:
-            LOGGER.exception("%s attention discovery failed", self.eye)
-            self.state = "LOST"
+            LOGGER.exception("%s attention calculation failed", self.eye)
             return False
 
-    def track(self, image) -> Optional[TrackingResult]:
-        if self.tracker is None:
+    def validate(self, image) -> Optional[ValidationResult]:
+        if self.validator is None:
             self.candidate = None
             return None
-        previous_state = self.state
-        result = self.tracker.locate(image)
-        if result.window is not None:
-            self.failure_count = 0
-            self.state = "TRACKING"
+        result = self.validator.validate(image)
+        if result.window is None:
+            self.candidate = None
+        else:
             self.candidate = {
                 "window": result.window,
-                "score": result.confidence,
-                "source": "tracking",
+                "score": result.similarity,
+                "source": "validated",
             }
-            if previous_state == "RELOCATING":
-                LOGGER.info(
-                    "%s relocation confirmed (confidence=%.3f, %.0fms)",
-                    self.eye, result.confidence, result.elapsed_time * 1000,
-                )
-        else:
-            self.failure_count += 1
-            self.candidate = None
-            if self.failure_count >= self.failure_limit:
-                self.tracker = None
-                self.failure_count = 0
-                self.state = "LOST"
-                LOGGER.info("%s tracking lost after %d failed frames", self.eye, self.failure_limit)
         return result
 
     def candidates(self):
@@ -246,8 +236,8 @@ class BabybotRuntime:
         self.right_camera = None
         self.web_server: Optional[ThreadingHTTPServer] = None
         self.web_thread: Optional[threading.Thread] = None
-        self.left_pipeline = EyePipeline("left", config.tracking_failure_limit)
-        self.right_pipeline = EyePipeline("right", config.tracking_failure_limit)
+        self.left_pipeline = EyePipeline("left")
+        self.right_pipeline = EyePipeline("right")
         self.attention_pool = ThreadPoolExecutor(
             max_workers=2,
             thread_name_prefix="attention",
@@ -272,6 +262,7 @@ class BabybotRuntime:
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.width)
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.height)
         camera.set(cv2.CAP_PROP_FPS, self.config.camera_fps)
+        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return camera
 
     def _open_cameras_until_ready(self) -> None:
@@ -311,7 +302,7 @@ class BabybotRuntime:
     def _capture_loop(self) -> None:
         observation_id = 0
         next_observation = time.monotonic()
-        next_preview = time.monotonic()
+        next_attention = time.monotonic()
         last_failure_log = 0.0
         while not self.stop_event.is_set():
             pair = self._capture_pair()
@@ -335,11 +326,40 @@ class BabybotRuntime:
                     right=right.copy(),
                 )
                 self.observations.append(observation)
-                left_submitted = self.left_pipeline.submit_discovery(self.attention_pool, observation)
-                right_submitted = self.right_pipeline.submit_discovery(self.attention_pool, observation)
-                LOGGER.info(
-                    "Observation %d stored (buffer=%d, discovery left=%s right=%s)",
-                    observation_id, len(self.observations), left_submitted, right_submitted,
+                attention_due = now >= next_attention
+                left_submitted = right_submitted = False
+                if attention_due:
+                    left_submitted = self.left_pipeline.submit_attention(
+                        self.attention_pool, observation
+                    )
+                    right_submitted = self.right_pipeline.submit_attention(
+                        self.attention_pool, observation
+                    )
+                    next_attention = max(
+                        next_attention + self.config.attention_interval,
+                        now,
+                    )
+
+                # A new result immediately replaces the old reference. Neither
+                # polling call waits unless its future already reports done.
+                self.left_pipeline.collect_attention()
+                self.right_pipeline.collect_attention()
+                left_result = self.left_pipeline.validate(left)
+                right_result = self.right_pipeline.validate(right)
+                self.previews.update(
+                    left,
+                    right,
+                    self.left_pipeline.candidates(),
+                    self.right_pipeline.candidates(),
+                    observation_id,
+                    self.config.jpeg_quality,
+                )
+                LOGGER.debug(
+                    "Observation %d stored (buffer=%d, attention left=%s right=%s, "
+                    "validation left=%s right=%s)",
+                    observation_id, len(self.observations), left_submitted,
+                    right_submitted, self._validation_summary(left_result),
+                    self._validation_summary(right_result),
                 )
                 observation_id += 1
                 next_observation = max(
@@ -347,36 +367,12 @@ class BabybotRuntime:
                     now,
                 )
 
-            # Polling is non-blocking: capture never waits for attention futures.
-            self.left_pipeline.collect_discovery()
-            self.right_pipeline.collect_discovery()
-
-            if now >= next_preview:
-                left_result = self.left_pipeline.track(left)
-                right_result = self.right_pipeline.track(right)
-                self.previews.update(
-                    left,
-                    right,
-                    self.left_pipeline.candidates(),
-                    self.right_pipeline.candidates(),
-                    observation_id - 1,
-                    self.config.jpeg_quality,
-                )
-                LOGGER.debug(
-                    "Tracking left=%s right=%s",
-                    self._tracking_summary(self.left_pipeline, left_result),
-                    self._tracking_summary(self.right_pipeline, right_result),
-                )
-                next_preview = max(next_preview + 1.0 / self.config.preview_fps, now)
-
     @staticmethod
-    def _tracking_summary(pipeline, result):
+    def _validation_summary(result):
         if result is None:
-            return pipeline.state
-        return (
-            f"{pipeline.state}/{result.confidence:.3f}/"
-            f"{result.elapsed_time * 1000:.0f}ms/fail={pipeline.failure_count}"
-        )
+            return "no-reference"
+        state = "shown" if result.window is not None else "hidden"
+        return f"{state}/{result.similarity:.3f}/{result.elapsed_time * 1000:.0f}ms"
 
     def _start_web_server(self) -> None:
         handler = make_request_handler(self.previews)
