@@ -261,7 +261,7 @@ class TemplateTracker:
 
 
 class Attention:
-    """Prefer novel motion, briefly retain focus, then use static saliency."""
+    """Objectness-first attention with size-aware motion and center ranking."""
 
     def __init__(
         self,
@@ -274,147 +274,184 @@ class Attention:
         verbose=True,
         analysis_width=320,
         hold_observations=10,
+        objectness_threshold=0.18,
     ):
-        del object  # Kept in the signature for compatibility with older callers.
+        del object, previous_focus, previous_focus_age, hold_observations
         if eye not in ("left", "right"):
             raise ValueError("eye must be 'left' or 'right'")
         self.observation = observation
         self.eye = eye
-        self.previous_focus = previous_focus
         self.previous_image = previous_image
-        self.previous_focus_age = int(previous_focus_age)
         self.verbose = verbose
         self.analysis_width = int(analysis_width)
-        self.hold_observations = int(hold_observations)
+        self.objectness_threshold = float(objectness_threshold)
         self.candidates = []
         self.elapsed_time = 0.0
         self.focus_source = "none"
-
         image = getattr(observation, eye)
         self.focus = self.find_attention_window(image)
 
     def find_attention_window(self, image):
         start = time.perf_counter()
         self._validate_image(image)
+        small, scale_x, scale_y = self.analysis_image(image)
+        motion_mask, motion_strength, motion_windows = self.motion_evidence(
+            small, self.previous_image
+        )
+        windows = self.static_windows(small.shape)
+        windows.extend(motion_windows)
+        windows = list(dict.fromkeys(windows))
         candidates = []
 
-        if self.previous_image is not None:
-            candidates = self.motion_candidates(image, self.previous_image)
+        for window in windows:
+            candidate = self.evaluate_candidate(
+                small, window, motion_mask, motion_strength
+            )
+            if candidate is None:
+                continue
+            mapped = self.map_and_pad_window(
+                window, scale_x, scale_y, image.shape, padding_fraction=0.10
+            )
+            candidate["window"] = mapped
+            candidates.append(candidate)
 
-        if candidates:
-            self.focus_source = "motion"
-        elif (
-            self.previous_focus is not None
-            and self.previous_focus_age < self.hold_observations
-        ):
-            candidates = [self.retained_candidate(image, self.previous_focus)]
-            self.focus_source = "retained"
-        else:
-            candidates = self.static_candidates(image)
-            self.focus_source = "static" if candidates else "none"
-
-        self.candidates = candidates[:5]
+        self.candidates = self.suppress_overlaps(
+            candidates, overlap_threshold=0.65, maximum_candidates=5
+        )
         self.elapsed_time = time.perf_counter() - start
+        if self.candidates:
+            self.focus_source = self.candidates[0]["source"]
         if self.verbose:
             self.print_results()
         return self.candidates[0]["window"] if self.candidates else None
 
-    def motion_candidates(self, current, previous):
-        if previous.shape[:2] != current.shape[:2]:
-            return []
-        current_small, scale_x, scale_y = self.analysis_image(current)
+    def static_windows(self, image_shape):
+        height, width = image_shape[:2]
+        minimum_side = min(height, width)
+        windows = []
+        for fraction in (0.15, 0.25, 0.40):
+            size = max(24, int(round(minimum_side * fraction)))
+            step = max(12, size // 2)
+            for y in range(0, max(1, height - size + 1), step):
+                for x in range(0, max(1, width - size + 1), step):
+                    windows.append((x, y, size, size))
+        return windows
+
+    def motion_evidence(self, current_small, previous_image):
+        empty = np.zeros(current_small.shape[:2], dtype=np.uint8)
+        if previous_image is None or previous_image.shape[:2] == (0, 0):
+            return empty, np.zeros_like(empty, dtype=np.float32), []
         previous_small = cv2.resize(
-            previous,
+            previous_image,
             (current_small.shape[1], current_small.shape[0]),
             interpolation=cv2.INTER_AREA,
         )
         current_gray = cv2.cvtColor(current_small, cv2.COLOR_BGR2GRAY)
         previous_gray = cv2.cvtColor(previous_small, cv2.COLOR_BGR2GRAY)
-
-        # Removing the median signed difference suppresses global exposure shifts.
         signed = current_gray.astype(np.int16) - previous_gray.astype(np.int16)
         signed -= int(np.median(signed))
-        difference = np.abs(signed).astype(np.uint8)
-        difference = cv2.GaussianBlur(difference, (5, 5), 0)
-        noise_level = float(np.median(difference))
-        threshold = int(np.clip(noise_level + 18.0, 18.0, 45.0))
-        mask = np.where(difference >= threshold, 255, 0).astype(np.uint8)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        difference = cv2.GaussianBlur(np.abs(signed).astype(np.uint8), (5, 5), 0)
+        threshold = int(np.clip(float(np.median(difference)) + 18.0, 18.0, 45.0))
+        raw_mask = np.where(difference >= threshold, 255, 0).astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        changed_fraction = float(np.mean(raw_mask > 0))
+        if changed_fraction > 0.55:
+            return empty, np.zeros_like(empty, dtype=np.float32), []
 
-        changed_fraction = float(np.mean(mask > 0))
-        # A near-global change is normally exposure adjustment or camera movement.
-        if changed_fraction < 0.002 or changed_fraction > 0.55:
-            return []
-
-        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask)
-        analysis_area = mask.shape[0] * mask.shape[1]
-        minimum_area = max(40, int(analysis_area * 0.0025))
-        candidates = []
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(raw_mask)
+        image_area = raw_mask.size
+        accepted = np.zeros_like(raw_mask)
+        windows = []
         for label in range(1, count):
             x, y, width, height, area = stats[label]
-            if area < minimum_area:
+            area_fraction = area / image_area
+            if area_fraction < 0.005:
                 continue
-            window = self.map_and_pad_window(
-                (int(x), int(y), int(width), int(height)),
-                scale_x,
-                scale_y,
-                current.shape,
-            )
-            region_mask = labels[y:y + height, x:x + width] == label
-            region_difference = difference[y:y + height, x:x + width]
-            intensity = float(np.mean(region_difference[region_mask]) / 255.0)
-            area_score = float(np.clip(area / (analysis_area * 0.12), 0.0, 1.0))
-            center = self.center_preference(window, current.shape)
-            score = float(np.clip(0.50 * intensity + 0.40 * area_score + 0.10 * center, 0.0, 1.0))
-            candidates.append(
-                self.make_candidate(current, window, score, motion=intensity, source="motion")
-            )
+            accepted[labels == label] = 255
+            windows.append((int(x), int(y), int(width), int(height)))
+        strength = difference.astype(np.float32) / 255.0
+        return accepted, strength, windows
 
-        return self.suppress_overlaps(candidates, maximum_candidates=5)
+    def evaluate_candidate(self, image, window, motion_mask, motion_strength):
+        x, y, width, height = self.clip_window(window, image.shape)
+        if width < 8 or height < 8:
+            return None
+        context_margin = max(4, int(round(max(width, height) * 0.25)))
+        cx1, cy1 = max(0, x - context_margin), max(0, y - context_margin)
+        cx2 = min(image.shape[1], x + width + context_margin)
+        cy2 = min(image.shape[0], y + height + context_margin)
+        context = image[cy1:cy2, cx1:cx2]
+        patch = image[y:y + height, x:x + width]
+        background_mask = np.ones(context.shape[:2], dtype=bool)
+        background_mask[y - cy1:y - cy1 + height, x - cx1:x - cx1 + width] = False
+        if not np.any(background_mask):
+            return None
 
-    def static_candidates(self, image):
-        """Cheap low-resolution fallback; motion candidates always take priority."""
-        small, scale_x, scale_y = self.analysis_image(image)
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-        saturation = hsv[:, :, 1].astype(np.float32) / 255.0
-        local_mean = cv2.GaussianBlur(gray, (31, 31), 0)
-        local_contrast = cv2.absdiff(gray, local_mean)
-        edges = cv2.Canny((gray * 255).astype(np.uint8), 60, 160).astype(np.float32) / 255.0
-        saliency = 0.45 * local_contrast + 0.30 * saturation + 0.25 * edges
-        saliency = cv2.GaussianBlur(saliency, (21, 21), 0)
+        patch_lab = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB).astype(np.float32)
+        context_lab = cv2.cvtColor(context, cv2.COLOR_BGR2LAB).astype(np.float32)
+        color_distance = np.linalg.norm(
+            np.mean(patch_lab.reshape(-1, 3), axis=0)
+            - np.mean(context_lab[background_mask], axis=0)
+        )
+        color_separation = float(np.clip(color_distance / 90.0, 0.0, 1.0))
 
-        height, width = gray.shape
-        window_size = max(24, int(min(height, width) * 0.20))
-        step = max(12, window_size // 2)
-        candidates = []
-        for y in range(0, max(1, height - window_size + 1), step):
-            for x in range(0, max(1, width - window_size + 1), step):
-                patch = saliency[y:y + window_size, x:x + window_size]
-                if patch.size == 0:
-                    continue
-                window = self.map_window(
-                    (x, y, window_size, window_size),
-                    scale_x,
-                    scale_y,
-                    image.shape,
-                )
-                visual = float(np.clip(np.mean(patch) * 4.0, 0.0, 1.0))
-                center = self.center_preference(window, image.shape)
-                score = 0.90 * visual + 0.10 * center
-                candidates.append(
-                    self.make_candidate(image, window, score, source="static")
-                )
-        return self.suppress_overlaps(candidates, maximum_candidates=5)
+        patch_gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+        context_gray = cv2.cvtColor(context, cv2.COLOR_BGR2GRAY)
+        brightness_difference = float(np.clip(
+            abs(float(np.mean(patch_gray)) - float(np.mean(context_gray[background_mask]))) / 128.0,
+            0.0, 1.0,
+        ))
+        edges = cv2.Canny(context_gray, 60, 160)
+        band = max(2, int(round(min(width, height) * 0.08)))
+        local_x, local_y = x - cx1, y - cy1
+        boundary = np.zeros(context.shape[:2], dtype=bool)
+        boundary[max(0, local_y - band):min(context.shape[0], local_y + band), local_x:local_x + width] = True
+        boundary[max(0, local_y + height - band):min(context.shape[0], local_y + height + band), local_x:local_x + width] = True
+        boundary[local_y:local_y + height, max(0, local_x - band):min(context.shape[1], local_x + band)] = True
+        boundary[local_y:local_y + height, max(0, local_x + width - band):min(context.shape[1], local_x + width + band)] = True
+        boundary_edges = float(np.mean(edges[boundary] > 0)) if np.any(boundary) else 0.0
+        edge_continuity = float(np.clip(boundary_edges / 0.18, 0.0, 1.0))
+        internal_consistency = float(np.clip(1.0 - np.std(patch_gray) / 90.0, 0.0, 1.0))
+        objectness = (
+            0.45 * color_separation + 0.30 * edge_continuity
+            + 0.15 * brightness_difference + 0.10 * internal_consistency
+        )
+        if objectness < self.objectness_threshold:
+            return None
 
-    def retained_candidate(self, image, window):
-        window = self.clip_window(window, image.shape)
-        # A small decay exposes stale focus without causing immediate flicker.
-        decay = max(0.0, 1.0 - self.previous_focus_age / max(1, self.hold_observations))
-        score = 0.35 + 0.35 * decay
-        return self.make_candidate(image, window, score, source="retained")
+        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+        saturation = float(np.mean(hsv[:, :, 1]) / 255.0)
+        color_appeal = float(np.clip(saturation / 0.65, 0.0, 1.0))
+        brightness = float(np.mean(hsv[:, :, 2]) / 255.0)
+        brightness_appeal = float(np.exp(-((brightness - 0.67) ** 2) / (2 * 0.24 ** 2)))
+        appearance = 0.65 * color_appeal + 0.35 * brightness_appeal
+        base_score = 0.65 * objectness + 0.35 * appearance
+
+        region_motion = motion_mask[y:y + height, x:x + width] > 0
+        motion_area_fraction = float(np.mean(region_motion))
+        full_motion_fraction = float(np.sum(region_motion) / motion_mask.size)
+        if full_motion_fraction < 0.005:
+            size_response = 0.0
+        elif full_motion_fraction < 0.02:
+            size_response = 0.20 * (full_motion_fraction - 0.005) / 0.015
+        elif full_motion_fraction < 0.10:
+            size_response = 0.20 + 0.80 * (full_motion_fraction - 0.02) / 0.08
+        else:
+            size_response = 1.0
+        if np.any(region_motion):
+            strength = float(np.mean(motion_strength[y:y + height, x:x + width][region_motion]))
+        else:
+            strength = 0.0
+        motion_value = float(np.clip(size_response * (0.5 + 0.5 * strength), 0.0, 1.0))
+        center = self.center_preference((x, y, width, height), image.shape)
+        score = float(np.clip(0.60 * base_score + 0.20 * motion_value + 0.20 * center, 0.0, 1.0))
+        source = "mixed" if motion_value > 0 else "static"
+        return self.make_candidate(
+            image, (x, y, width, height), score, motion=motion_value,
+            source=source, objectness=objectness, appearance=appearance,
+            motion_area=motion_area_fraction,
+        )
 
     def analysis_image(self, image):
         height, width = image.shape[:2]
@@ -435,10 +472,11 @@ class Attention:
         )
         return self.clip_window(mapped, image_shape)
 
-    def map_and_pad_window(self, window, scale_x, scale_y, image_shape):
+    def map_and_pad_window(
+            self, window, scale_x, scale_y, image_shape, padding_fraction=0.10):
         x, y, width, height = self.map_window(window, scale_x, scale_y, image_shape)
-        padding_x = max(8, int(width * 0.20))
-        padding_y = max(8, int(height * 0.20))
+        padding_x = max(2, int(round(width * padding_fraction)))
+        padding_y = max(2, int(round(height * padding_fraction)))
         return self.clip_window(
             (x - padding_x, y - padding_y, width + 2 * padding_x, height + 2 * padding_y),
             image_shape,
@@ -460,7 +498,9 @@ class Attention:
         dy = (y + height / 2.0 - image_height / 2.0) / max(1.0, image_height / 2.0)
         return float(np.clip(1.0 - np.hypot(dx, dy) / np.sqrt(2.0), 0.0, 1.0))
 
-    def make_candidate(self, image, window, score, motion=0.0, source="static"):
+    def make_candidate(
+            self, image, window, score, motion=0.0, source="static",
+            objectness=0.0, appearance=0.0, motion_area=0.0):
         x, y, width, height = self.clip_window(window, image.shape)
         patch = image[y:y + height, x:x + width]
         if patch.size:
@@ -481,6 +521,9 @@ class Attention:
             "visual": float(np.clip(score, 0.0, 1.0)),
             "center": center,
             "motion": float(np.clip(motion, 0.0, 1.0)),
+            "motion_area": float(np.clip(motion_area, 0.0, 1.0)),
+            "objectness": float(np.clip(objectness, 0.0, 1.0)),
+            "appearance": float(np.clip(appearance, 0.0, 1.0)),
             "source": source,
             "score": float(np.clip(score, 0.0, 1.0)),
         }

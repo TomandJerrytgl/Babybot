@@ -53,7 +53,7 @@ class AttentionTests(unittest.TestCase):
         self.assertTrue(result.candidates)
         self.assertIsNotNone(result.focus)
 
-    def test_new_object_is_selected_as_motion(self):
+    def test_large_moving_object_uses_unified_scoring(self):
         previous = np.zeros((200, 320, 3), dtype=np.uint8)
         current = previous.copy()
         current[60:160, 150:280] = (40, 80, 220)
@@ -65,32 +65,42 @@ class AttentionTests(unittest.TestCase):
             verbose=False,
         )
         self.assertTrue(result.candidates)
-        self.assertEqual(result.focus_source, "motion")
+        self.assertEqual(result.focus_source, "mixed")
+        self.assertGreater(result.candidates[0]["motion"], 0.0)
         x, y, width, height = result.focus
         self.assertLessEqual(x, 150)
         self.assertLessEqual(y, 60)
         self.assertGreaterEqual(x + width, 280)
         self.assertGreaterEqual(y + height, 160)
 
-    def test_stationary_focus_is_retained_temporarily(self):
-        image = np.zeros((120, 160, 3), dtype=np.uint8)
-        item = Observation(1, time.time(), time.monotonic(), image, image.copy())
-        result = Attention(
-            item,
-            previous_image=image.copy(),
-            previous_focus=(40, 30, 50, 50),
-            previous_focus_age=2,
-            verbose=False,
-        )
-        self.assertEqual(result.focus_source, "retained")
-        self.assertEqual(result.focus, (40, 30, 50, 50))
+    def test_small_motion_below_half_percent_gets_no_motion_bonus(self):
+        previous = np.zeros((200, 320, 3), dtype=np.uint8)
+        current = previous.copy()
+        current[90:100, 150:160] = (0, 0, 255)
+        item = Observation(1, time.time(), time.monotonic(), current, current.copy())
+        result = Attention(item, previous_image=previous, verbose=False)
+        self.assertTrue(all(candidate["motion"] == 0.0 for candidate in result.candidates))
 
     def test_global_brightness_change_is_not_motion(self):
         previous = np.full((120, 160, 3), 40, dtype=np.uint8)
         current = np.full((120, 160, 3), 90, dtype=np.uint8)
         item = Observation(1, time.time(), time.monotonic(), current, current.copy())
         result = Attention(item, previous_image=previous, verbose=False)
-        self.assertNotEqual(result.focus_source, "motion")
+        self.assertTrue(all(candidate["motion"] == 0.0 for candidate in result.candidates))
+
+    def test_center_preference_breaks_equal_visual_tie(self):
+        attention = Attention.__new__(Attention)
+        shape = (200, 320, 3)
+        center = attention.center_preference((135, 75, 50, 50), shape)
+        edge = attention.center_preference((0, 0, 50, 50), shape)
+        self.assertGreater(center, edge)
+
+    def test_output_window_adds_ten_percent_padding(self):
+        attention = Attention.__new__(Attention)
+        window = attention.map_and_pad_window(
+            (50, 40, 100, 80), 1.0, 1.0, (200, 300, 3), 0.10
+        )
+        self.assertEqual(window, (40, 32, 120, 96))
 
 
 class TemplateTrackerTests(unittest.TestCase):
