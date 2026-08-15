@@ -1,20 +1,195 @@
-#initial
-V1
-Component:
-Arducam 100fps Global Shutter Color USB Camera Board, 1MP OV9782 *2
-DS3218*1
-BNO085 IMU*1
-NVIDIA Jetson Orin Nano Super Developer Kit*1
-Samsung 990 EVO Plus SSD 1TB*1
-[Single] Computer Speaker for Desktop PC*1
-reSpeaker XVF3800 USB Microphone Array*1
-Talentcell Rechargeable 12V*1
+# Babybot
 
-V1.0.0
-enable identify object through two camera.
-Track RGB signals across image rows and columns. 
-First, perform an initial separation based on color change: if the color changes dramatically, separate the region into different objects. 
-Second, perform another separation based on depth: if the depth change is not smooth, separate the region into different objects. 
-Finally, run a CNN to extract visual features from each separated region.
-In this stage, calculation time doesn't matter. It's acceptable that the algorthm is too complicated.
-V0.0.1 changing the logic. Introduce attention. Use attention to select region to do depth measure and object features extract.
+## 项目目标
+
+Babybot 是一个逐步发展的具身学习机器人。它通过类人的多种感官获得真实数据，从中形成更容易处理的 perception，使用 attention 找出当前值得注意的内容，并在后续阶段通过神经网络学习不同感知特征之间的联系。
+
+本文件区分：
+
+- 已确定的总体设计；
+- 当前阶段已经实现的行为；
+- 未来可能加入、仍需实验的机制。
+
+## 硬件
+
+- Arducam OV9782 1MP Global Shutter USB Camera ×2
+- DS3218 Servo ×1
+- BNO085 IMU ×1
+- NVIDIA Jetson Orin Nano Super Developer Kit ×1
+- Samsung 990 EVO Plus SSD 1TB ×1
+- Computer Speaker ×1
+- reSpeaker XVF3800 USB Microphone Array ×1
+- Talentcell Rechargeable 12V ×1
+
+## 总体设计
+
+### 感官
+
+Babybot 目前规划的感官包括：
+
+- 双目视觉；
+- 听觉；
+- 加速度感觉，用于感知自身运动；
+- 时间感知，用于理解事情发生的先后、持续时间和间隔。
+
+未来可能继续增加其他感官。
+
+### Observation
+
+Observation 是 Babybot 获得的真实感官，保留感官产生的原始数据。它表示 Babybot 在当时实际看见、听见或感受到的内容，而不是机器人已经理解后的结果。
+
+当前视觉设计中，双目摄像头原始图像作为短生命周期 observation 使用：
+
+- 原始分辨率为 1280×800；
+- 不保存视觉 observation 历史；
+- 不为历史记录压缩或写入左右眼图像；
+- 运行时只保留最新双目帧，旧帧自动被新帧覆盖；
+- 网页以 5 Hz 显示最新左右眼 observation。
+
+未来听觉、IMU和其他感官如何组成 observation，仍需在相应阶段继续定义。
+
+### Perception
+
+Perception 是由 observation 处理得到、更容易被 Babybot 理解并用于寻找 attention 的数据。Perception 可以过滤、压缩或转换大量原始信息，因此不等同于真实感官，也不要求保留 observation 的全部内容。
+
+第一版视觉 perception：
+
+- 从最新双目 observation 生成；
+- 左右眼均缩放为 320×200 彩色图像；
+- 生成频率为 2 Hz；
+- 网页独立显示左右眼 perception；
+- attention 在 perception 上计算，而不是在原始分辨率 observation 上计算。
+
+后续 perception 可能加入颜色、边缘、深度、大小、声音片段或其他处理结果，但具体形式尚未确定。
+
+### Attention
+
+Attention 对 perception 进行评估，划分出当前值得注意的内容。视觉 attention 的框直接显示在 perception 上，同时映射回原始分辨率并显示在 observation 页面上。
+
+当前调度规则：
+
+- 每次产生 perception 时尝试执行一次 attention，目标频率为 2 Hz；
+- 左右眼独立计算；
+- 同一只眼不允许多个 attention 任务重叠或排队；
+- 上一次尚未完成时跳过本次提交，避免旧任务积压；
+- 新结果完成前持续显示上一组框；
+- 新结果为空时清空对应眼睛的框；
+- 计算异常时保留上一组框。
+
+Attention 的具体识别算法仍处于实验阶段，不视为已经稳定的最终设计。
+
+### 后续学习设想
+
+Attention 划分出的值得注意内容，将在后续阶段交给神经网络提取和学习感知特征。
+
+双目视觉希望逐步获得独立物体、颜色、距离、大小等信息。听觉希望识别人声，并尝试根据声音的频率、分贝和其他特征划分重复出现的声音或单词。加速度感官用于表示 Babybot 自身的运动。
+
+Babybot 希望学习经常共同出现的不同感知之间的联系。例如：
+
+- 某个视觉对象出现时经常听到 “printer”；
+- 再次看到该对象时，Babybot 可以尝试发出 “printer”；
+- 听到 “printer” 时，Babybot 可以尝试寻找对应视觉对象。
+
+同样的方式可能扩展到运动。例如 Babybot 感觉到向前加速度、视觉中的事物逐渐放大，同时听到 “move forward”，便可能逐步建立这些感知特征和声音之间的联系。
+
+具体神经网络结构、学习方式和关联表示尚未确定，将在后续阶段继续设计。
+
+### 人工反馈
+
+未来计划加入人工反馈按钮：
+
+- 判断正确时给予奖励；
+- 判断错误时给予否定；
+- 多次否定当前联系后，Babybot 可以尝试其他高概率联系；
+- 系统应允许保留多个可能联系，而不是只有一个不可更改的结果。
+
+具体奖励数值、否定规则和候选切换机制尚未确定。
+
+### 内部状态
+
+未来可能加入好奇心、活跃程度等数值影响 Babybot 的行为。例如：
+
+- 好奇心较高时，对某个 attention 内容观察更久；
+- 当前内容与已知内容高度相似时，好奇心下降；
+- attention 随后转向其他可能存在的内容。
+
+这一部分是粗略设想，后续实践可以改变具体机制。
+
+## 当前视觉运行数据流
+
+```text
+双目摄像头持续抓帧
+        ↓
+容量为 1 的最新原始帧缓存
+        ├──→ Observation 网页显示：1280×800，5 Hz
+        │
+        └──→ Perception：320×200，2 Hz
+                    ↓
+              左右眼 Attention
+                    ↓
+          Perception 坐标注意力框
+              ├──→ 显示在 Perception
+              └──→ 映射后显示在 Observation
+```
+
+摄像头采集、网页原图编码和 attention 必须相互独立。任何处理来不及时都应使用最新帧，不允许形成越来越旧的图像队列。
+
+### 运行隔离
+
+为了防止 attention 计算拖慢实时感官显示，当前运行程序采用进程级隔离：
+
+- 摄像头采集在主进程的独立线程中持续运行；
+- observation 网页编码在独立线程中以 5 Hz 读取最新帧；
+- perception 在主进程中以 2 Hz 从最新 observation 生成；
+- 左右眼 attention 由两个独立工作进程计算；
+- attention 工作进程只接收 320×200 perception，不接收原始分辨率图像；
+- Linux 上降低 attention 工作进程的 CPU 调度优先级；
+- attention 忙碌时跳过新提交，不排队；
+- attention 失败或过慢不应阻塞摄像头和 observation 网页显示。
+
+进程仍会共享 Jetson 的 CPU 和内存带宽，因此隔离不能消除全部硬件资源竞争。运行日志会定期报告 observation 网页编码的实际频率，用于确认实时显示是否接近 5 Hz。
+
+## 当前网页
+
+网页仅监听 `127.0.0.1`，通过 VS Code 或 SSH 端口转发访问。页面显示四个画面：
+
+- 左眼原始 observation，5 Hz；
+- 右眼原始 observation，5 Hz；
+- 左眼 perception，2 Hz；
+- 右眼 perception，2 Hz。
+
+四个画面均可显示最近一次 attention 框。
+
+## 当前性能约束
+
+为了让 attention 实际达到 2 Hz，单眼计算时间需要低于 500 ms。调度系统会防止任务积压，但 attention 算法尚需继续优化才能稳定达到目标频率。
+
+## 设计状态
+
+当前阶段已经确定 observation、perception 和 attention 的基本关系，但视觉 attention 算法、听觉处理、IMU处理、神经网络学习、跨感官联系、人工反馈以及内部状态仍需要通过后续实验逐步实现。
+## 2026-08 Conscious and Memory vision stage
+
+The visual runtime now uses the following confirmed architecture:
+
+- Raw stereo observation is a capacity-one latest-frame buffer. It is not saved and
+  is shown without attention boxes at a target 20 Hz.
+- Perception is a 320x200 stereo derivative. It has no fixed frequency: one complete
+  stereo cognition cycle is displayed atomically, then the next cycle starts from the
+  newest available observation.
+- Attention runs in one lower-priority worker process, isolated from camera capture and
+  raw web preview.
+- With an empty conscious list, default attention searches both eyes and prefers a
+  visually compatible, center-near stereo pair. Familiar memory matches are skipped.
+- With a conscious object, default attention is completely disabled. The stored left
+  and right templates are searched at independently varying width and height.
+- Three consecutive compatible stereo matches are required before learning. A failed
+  match resets the consecutive count.
+- Memory persists up to 20 distinct visual objects, with at most three diverse stereo
+  samples per object. Reaching 20 stops learning only; the runtime continues.
+- Until stereo cameras are calibrated, memory records disparity and pixel size but
+  leaves distance and physical size unknown.
+- Curiosity falls as a conscious object becomes familiar. At the removal threshold it
+  leaves conscious, allowing default attention to seek another object.
+
+Runtime memory data is stored under `memory/` and ignored by Git; only its README is
+tracked.

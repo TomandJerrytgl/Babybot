@@ -1,5 +1,9 @@
+import pickle
+import tempfile
 import time
 import unittest
+from concurrent.futures import Future
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
@@ -13,8 +17,20 @@ from attention import (
     TemplateTracker,
     visual_signature,
 )
-from main import EyePipeline, PreviewStore, RuntimeConfig, encode_preview, make_request_handler
-from observation import Observation, ObservationBuffer
+from main import (
+    LatestStereoFrame,
+    PreviewStore,
+    RuntimeConfig,
+    StereoCognition,
+    calculate_stereo_attention,
+    encode_preview,
+    locate_template,
+    make_request_handler,
+)
+from conscious import Conscious, ConsciousObject, visual_feature
+from memory import MemoryStore
+from observation import Observation
+from perception import Perception
 from http.server import ThreadingHTTPServer
 import threading
 
@@ -30,19 +46,6 @@ def observation(identifier, monotonic_timestamp):
     )
 
 
-class ObservationBufferTests(unittest.TestCase):
-    def test_discards_items_older_than_retention_window(self):
-        buffer = ObservationBuffer(retention_seconds=20.0)
-        buffer.append(observation(1, 10.0))
-        buffer.append(observation(2, 29.9))
-        buffer.append(observation(3, 30.1))
-        self.assertEqual([item.observation_id for item in buffer.snapshot()], [2, 3])
-
-    def test_rejects_non_positive_retention(self):
-        with self.assertRaises(ValueError):
-            ObservationBuffer(0)
-
-
 class AttentionTests(unittest.TestCase):
     def test_right_eye_is_processed_independently(self):
         left = np.zeros((120, 160, 3), dtype=np.uint8)
@@ -53,40 +56,38 @@ class AttentionTests(unittest.TestCase):
         self.assertTrue(result.candidates)
         self.assertIsNotNone(result.focus)
 
-    def test_large_moving_object_uses_unified_scoring(self):
-        previous = np.zeros((200, 320, 3), dtype=np.uint8)
-        current = previous.copy()
-        current[60:160, 150:280] = (40, 80, 220)
-        item = Observation(1, time.time(), time.monotonic(), current, current.copy())
-        result = Attention(
-            item,
-            eye="left",
-            previous_image=previous,
-            verbose=False,
-        )
+    def test_colored_single_frame_object_is_detected(self):
+        image = np.full((200, 320, 3), 180, dtype=np.uint8)
+        image[60:160, 150:280] = (40, 80, 220)
+        item = Observation(1, time.time(), time.monotonic(), image, image.copy())
+        result = Attention(item, eye="left", verbose=False)
         self.assertTrue(result.candidates)
-        self.assertEqual(result.focus_source, "mixed")
-        self.assertGreater(result.candidates[0]["motion"], 0.0)
+        self.assertEqual(result.focus_source, "default")
         x, y, width, height = result.focus
-        self.assertLessEqual(x, 150)
-        self.assertLessEqual(y, 60)
-        self.assertGreaterEqual(x + width, 280)
-        self.assertGreaterEqual(y + height, 160)
+        self.assertGreaterEqual(width, 16)
+        self.assertGreaterEqual(height, 16)
+        self.assertGreater(
+            Attention.intersection_area((x, y, width, height), (150, 60, 130, 100)),
+            0,
+        )
 
-    def test_small_motion_below_half_percent_gets_no_motion_bonus(self):
-        previous = np.zeros((200, 320, 3), dtype=np.uint8)
-        current = previous.copy()
-        current[90:100, 150:160] = (0, 0, 255)
-        item = Observation(1, time.time(), time.monotonic(), current, current.copy())
-        result = Attention(item, previous_image=previous, verbose=False)
-        self.assertTrue(all(candidate["motion"] == 0.0 for candidate in result.candidates))
+    def test_same_single_frame_produces_same_default_attention(self):
+        image = np.full((120, 160, 3), 160, dtype=np.uint8)
+        image[30:90, 55:120] = (30, 100, 220)
+        item = Observation(1, time.time(), time.monotonic(), image, image.copy())
+        first = Attention(item, verbose=False)
+        second = Attention(item, verbose=False)
+        self.assertEqual(first.focus, second.focus)
+        self.assertEqual(
+            [candidate["score"] for candidate in first.candidates],
+            [candidate["score"] for candidate in second.candidates],
+        )
 
-    def test_global_brightness_change_is_not_motion(self):
-        previous = np.full((120, 160, 3), 40, dtype=np.uint8)
-        current = np.full((120, 160, 3), 90, dtype=np.uint8)
-        item = Observation(1, time.time(), time.monotonic(), current, current.copy())
-        result = Attention(item, previous_image=previous, verbose=False)
-        self.assertTrue(all(candidate["motion"] == 0.0 for candidate in result.candidates))
+    def test_uniform_background_creates_no_candidate(self):
+        image = np.full((120, 160, 3), 120, dtype=np.uint8)
+        item = Observation(1, time.time(), time.monotonic(), image, image.copy())
+        result = Attention(item, verbose=False)
+        self.assertEqual(result.candidates, [])
 
     def test_center_preference_breaks_equal_visual_tie(self):
         attention = Attention.__new__(Attention)
@@ -95,12 +96,16 @@ class AttentionTests(unittest.TestCase):
         edge = attention.center_preference((0, 0, 50, 50), shape)
         self.assertGreater(center, edge)
 
-    def test_output_window_adds_ten_percent_padding(self):
-        attention = Attention.__new__(Attention)
-        window = attention.map_and_pad_window(
-            (50, 40, 100, 80), 1.0, 1.0, (200, 300, 3), 0.10
-        )
-        self.assertEqual(window, (40, 32, 120, 96))
+    def test_default_output_allows_adaptive_rectangles(self):
+        image = np.full((200, 320, 3), 170, dtype=np.uint8)
+        image[75:125, 70:250] = (20, 80, 230)
+        item = Observation(1, time.time(), time.monotonic(), image, image.copy())
+        result = Attention(item, verbose=False)
+        self.assertTrue(result.candidates)
+        self.assertTrue(any(
+            candidate["window"][2] > candidate["window"][3]
+            for candidate in result.candidates
+        ))
 
 
 class TemplateTrackerTests(unittest.TestCase):
@@ -133,29 +138,41 @@ class TemplateTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.window, (80, 60, 50, 40))
 
 
-class EyePipelineTests(unittest.TestCase):
-    def test_failed_validation_hides_candidate_immediately(self):
-        source = TemplateTrackerTests.textured_frame(80, 60)
-        reference = AttentionReference(
-            observation_id=1,
-            timestamp=1.0,
-            window=(80, 60, 50, 40),
-            signature=visual_signature(source, (80, 60, 50, 40)),
-        )
-        pipeline = EyePipeline("left")
-        pipeline.validators = [AttentionValidator(reference, similarity_threshold=0.95)]
-        pipeline.current_candidates = [{"window": reference.window, "score": 1.0}]
-        pipeline.validate(np.full_like(source, 255))
-        self.assertEqual(pipeline.candidates(), [])
+class StereoPipelineTests(unittest.TestCase):
+    def test_attention_process_payload_is_serializable(self):
+        perception = Perception.from_observation(observation(1, 1.0))
+        payload = pickle.dumps((calculate_stereo_attention, perception, "default", None))
+        self.assertTrue(payload)
 
-    def test_partial_overlap_is_removed_but_containment_is_allowed(self):
+    def test_template_search_changes_width_and_height(self):
+        template = np.zeros((20, 30, 3), np.uint8)
+        template[:, :] = (10, 80, 210)
+        cv2.line(template, (0, 0), (29, 19), (255, 255, 255), 2)
+        image = np.zeros((100, 140, 3), np.uint8)
+        image[30:54, 50:86] = cv2.resize(template, (36, 24))
+        result = locate_template(image, template)
+        self.assertGreater(result["similarity"], .85)
+        self.assertNotEqual(result["window"][2], result["window"][3])
+
+    def test_conscious_capacity_and_removal(self):
+        conscious = Conscious(capacity=3)
+        image = np.zeros((8, 8, 3), np.uint8)
+        for index in range(4):
+            item = ConsciousObject(str(index), image, image, np.zeros(99), (0, 0, 8, 8),
+                                   (0, 0, 8, 8), 0.0)
+            self.assertEqual(conscious.add(item), index < 3)
+        self.assertEqual(len(conscious), 3)
+        self.assertTrue(conscious.remove("1"))
+        self.assertEqual(len(conscious), 2)
+
+    def test_partial_overlap_keeps_higher_score_not_larger_area(self):
+        attention = Attention.__new__(Attention)
         candidates = [
-            {"window": (10, 10, 100, 100), "score": 0.9, "rank": 1},
-            {"window": (30, 30, 20, 20), "score": 0.8, "rank": 2},
-            {"window": (90, 90, 50, 50), "score": 0.7, "rank": 3},
+            {"window": (10, 10, 100, 100), "score": 0.6, "rank": 1},
+            {"window": (90, 90, 50, 50), "score": 0.8, "rank": 3},
         ]
-        selected = EyePipeline._filter_candidates(candidates)
-        self.assertEqual([item["rank"] for item in selected], [1, 2])
+        selected = attention.suppress_overlaps(candidates)
+        self.assertEqual([item["rank"] for item in selected], [3])
 
 
 class AttentionValidatorTests(unittest.TestCase):
@@ -172,6 +189,8 @@ class AttentionValidatorTests(unittest.TestCase):
         result = validator.validate(moved)
         self.assertIsNotNone(result.window)
         self.assertEqual(validator.last_confirmed_window, result.window)
+        self.assertAlmostEqual(result.window[0], 105, delta=2)
+        self.assertAlmostEqual(result.window[1], 70, delta=2)
 
     def test_reference_replacement_resets_search_center(self):
         image = TemplateTrackerTests.textured_frame(80, 60)
@@ -185,41 +204,83 @@ class AttentionValidatorTests(unittest.TestCase):
 
 
 class CandidateGenerationTests(unittest.TestCase):
-    def test_static_windows_include_non_square_aspects(self):
+    def test_coarse_windows_include_square_and_rectangular_shapes(self):
         attention = Attention.__new__(Attention)
-        windows = attention.static_windows((200, 320, 3))
-        self.assertTrue(any(width != height for _x, _y, width, height in windows))
+        windows = attention.coarse_adaptive_windows((200, 320, 3), scales=(64,))
+        self.assertTrue(any(width == height for _x, _y, width, height in windows))
+        self.assertTrue(any(width > height for _x, _y, width, height in windows))
+        self.assertTrue(any(width < height for _x, _y, width, height in windows))
 
-    def test_full_containment_allowed_but_partial_overlap_rejected(self):
-        self.assertTrue(Attention.windows_compatible((0, 0, 100, 100), (20, 20, 20, 20)))
-        self.assertFalse(Attention.windows_compatible((0, 0, 100, 100), (80, 80, 50, 50)))
-
-    def test_large_motion_reduces_center_bonus(self):
-        center = 1.0
-        no_motion_center_bonus = 0.20 * center * (1.0 - 0.0)
-        large_motion_center_bonus = 0.20 * center * (1.0 - 1.0)
-        self.assertGreater(no_motion_center_bonus, large_motion_center_bonus)
-
-    def test_nearby_finger_shapes_merge_before_area_filter(self):
+    def test_coarse_windows_cover_far_image_edges(self):
         attention = Attention.__new__(Attention)
-        previous = np.zeros((200, 320, 3), dtype=np.uint8)
-        current = previous.copy()
-        cv2.rectangle(current, (130, 95), (185, 155), (60, 120, 220), -1)
-        for x in (132, 145, 158, 171):
-            cv2.rectangle(current, (x, 55), (x + 8, 105), (60, 120, 220), -1)
-        mask, _strength, windows = attention.motion_evidence(current, previous)
-        self.assertTrue(windows)
-        self.assertGreater(np.mean(mask > 0), 0.005)
-        hand_windows = [window for window in windows if window[1] <= 60 and window[1] + window[3] >= 150]
-        self.assertTrue(hand_windows)
+        windows = attention.coarse_adaptive_windows(
+            (200, 320, 3), scales=(64,), aspect_ratios=(1.0,)
+        )
+        self.assertIn((0, 0, 64, 64), windows)
+        self.assertIn((256, 136, 64, 64), windows)
 
-    def test_static_contours_create_object_candidate(self):
+    def test_refinement_changes_width_and_height_independently(self):
         attention = Attention.__new__(Attention)
-        image = np.full((200, 320, 3), 180, dtype=np.uint8)
-        cv2.rectangle(image, (100, 60), (220, 150), (20, 80, 220), -1)
-        windows = attention.static_contour_windows(image)
-        self.assertTrue(any(width != height for _x, _y, width, height in windows))
+        windows = attention.refined_windows((80, 60, 64, 64), (200, 320, 3))
+        self.assertIn((80, 60, 72, 56), windows)
+        self.assertIn((80, 60, 56, 72), windows)
 
+    def test_surround_contrast_creates_candidate(self):
+        attention = Attention.__new__(Attention)
+        image = np.full((200, 320, 3), 165, dtype=np.uint8)
+        image[68:132, 128:192] = (20, 80, 230)
+        candidate = attention.evaluate_fixed_window(image, (128, 68, 64, 64))
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate["window"], (128, 68, 64, 64))
+
+    def test_uniform_window_is_not_attention(self):
+        attention = Attention.__new__(Attention)
+        image = np.full((200, 320, 3), 120, dtype=np.uint8)
+        candidate = attention.evaluate_fixed_window(image, (128, 68, 64, 64))
+        self.assertIsNone(candidate)
+
+    def test_colorful_window_scores_above_white_window(self):
+        attention = Attention.__new__(Attention)
+        white = np.full((200, 320, 3), 120, dtype=np.uint8)
+        colorful = white.copy()
+        white[68:132, 128:192] = 245
+        colorful[68:132, 128:192] = (20, 80, 230)
+        white_candidate = attention.evaluate_fixed_window(white, (128, 68, 64, 64))
+        colorful_candidate = attention.evaluate_fixed_window(colorful, (128, 68, 64, 64))
+        self.assertIsNotNone(colorful_candidate)
+        if white_candidate is not None:
+            self.assertGreater(colorful_candidate["score"], white_candidate["score"])
+
+    def test_internal_edges_raise_attention(self):
+        attention = Attention.__new__(Attention)
+        image = np.full((200, 320, 3), 120, dtype=np.uint8)
+        for offset in range(0, 64, 8):
+            cv2.line(image, (128 + offset, 68), (128 + offset, 131), (220, 220, 220), 2)
+        candidate = attention.evaluate_fixed_window(image, (128, 68, 64, 64))
+        self.assertIsNotNone(candidate)
+        self.assertGreater(candidate["edge"], 0.0)
+
+    def test_integral_window_scan_is_fast(self):
+        image = np.full((200, 320, 3), 160, dtype=np.uint8)
+        image[50:150, 100:220] = (20, 80, 230)
+        item = Observation(1, time.time(), time.monotonic(), image, image.copy())
+        started = time.perf_counter()
+        Attention(item, verbose=False)
+        self.assertLess(time.perf_counter() - started, 5.00)
+
+    def test_higher_score_inner_box_is_kept_with_outer_box(self):
+        attention = Attention.__new__(Attention)
+        outer = {"window": (0, 0, 100, 100), "score": 0.6}
+        inner = {"window": (20, 20, 30, 30), "score": 0.8}
+        selected = attention.suppress_overlaps([outer, inner])
+        self.assertEqual(len(selected), 2)
+
+    def test_lower_score_inner_box_is_suppressed(self):
+        attention = Attention.__new__(Attention)
+        outer = {"window": (0, 0, 100, 100), "score": 0.8}
+        inner = {"window": (20, 20, 30, 30), "score": 0.6}
+        selected = attention.suppress_overlaps([outer, inner])
+        self.assertEqual(selected, [outer])
 
 class WebPreviewTests(unittest.TestCase):
     def test_default_web_host_is_loopback_only(self):
@@ -227,11 +288,22 @@ class WebPreviewTests(unittest.TestCase):
 
     def test_default_processing_rates(self):
         config = RuntimeConfig()
-        self.assertEqual(config.observation_interval, 0.1)
-        self.assertEqual(config.attention_interval, 0.5)
-        self.assertEqual(config.preview_fps, 10.0)
-        self.assertEqual(config.observation_jpeg_quality, 85)
-        self.assertEqual(config.analysis_width, 320)
+        self.assertFalse(hasattr(config, "perception_interval"))
+        self.assertEqual(config.observation_preview_fps, 20.0)
+        self.assertEqual(config.perception_width, 320)
+        self.assertEqual(config.perception_height, 200)
+        self.assertFalse(hasattr(config, "retention_seconds"))
+
+    def test_latest_frame_buffer_overwrites_old_frame(self):
+        store = LatestStereoFrame()
+        first = np.zeros((2, 2, 3), dtype=np.uint8)
+        second = np.full((2, 2, 3), 255, dtype=np.uint8)
+        store.update(first, first)
+        store.update(second, second)
+        left, right, version = store.snapshot()
+        self.assertEqual(version, 2)
+        self.assertTrue(np.all(left == 255))
+        self.assertTrue(np.all(right == 255))
 
     def setUp(self):
         self.store = PreviewStore()
@@ -248,17 +320,23 @@ class WebPreviewTests(unittest.TestCase):
 
     def test_page_and_stereo_frames_are_served(self):
         image = np.zeros((32, 48, 3), dtype=np.uint8)
-        self.store.update(image, image, [], [], 7, 80)
+        self.store.update("observation", image, image, [], [], 7, 80)
+        self.store.update("perception", image, image, [], [], 3, 80)
         page = urlopen(self.base_url + "/", timeout=2).read().decode("utf-8")
-        self.assertIn("Left eye", page)
-        response = urlopen(self.base_url + "/frame/right.jpg", timeout=2)
+        self.assertIn("Raw observation", page)
+        self.assertIn("Perception", page)
+        response = urlopen(self.base_url + "/frame/observation/right.jpg", timeout=2)
         body = response.read()
-        self.assertEqual(response.headers["X-Observation-Id"], "7")
+        self.assertEqual(response.headers["X-Frame-Id"], "7")
         self.assertIsNotNone(cv2.imdecode(np.frombuffer(body, np.uint8), cv2.IMREAD_COLOR))
+        perception_response = urlopen(
+            self.base_url + "/frame/perception/left.jpg", timeout=2
+        )
+        self.assertEqual(perception_response.headers["X-Frame-Id"], "3")
 
     def test_frame_is_unavailable_before_first_observation(self):
         with self.assertRaises(HTTPError) as context:
-            urlopen(self.base_url + "/frame/left.jpg", timeout=2)
+            urlopen(self.base_url + "/frame/observation/left.jpg", timeout=2)
         self.assertEqual(context.exception.code, 503)
 
 

@@ -71,3 +71,7 @@ dist/
 ############################################################
 # output/
 # results/
+
+# Runtime visual memory (keep only its documentation in Git)
+memory/*
+!memory/README.md
