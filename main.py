@@ -26,6 +26,7 @@ import numpy as np
 from attention import Attention
 from observation import Observation
 from perception import Perception
+from region_proposal import RegionProposalConfig, StereoRegionProposer
 
 
 LOGGER = logging.getLogger("babybot")
@@ -57,6 +58,24 @@ def lower_attention_process_priority():
 def calculate_attention_pair(perception: Perception, settings: dict):
     """Process-safe entry point that computes both eyes for one perception."""
     started = time.perf_counter()
+    proposal_config = RegionProposalConfig(
+        minimum_region_fraction=settings["minimum_region_fraction"],
+        growth_threshold=settings["region_growth_threshold"],
+        minimum_merge_score=settings["minimum_merge_score"],
+        stereo_merge_weight=settings["stereo_merge_weight"],
+    )
+    try:
+        region_result = StereoRegionProposer(proposal_config).propose(
+            perception.left, perception.right
+        )
+    except Exception:
+        region_result = {
+            "left": [], "right": [], "visualizations": {},
+            "diagnostics": {
+                "mode": "multiscale_fallback",
+                "proposal_error": traceback.format_exc(),
+            },
+        }
     arguments = {
         "verbose": False,
         "objectness_threshold": settings["minimum_objectness"],
@@ -68,13 +87,18 @@ def calculate_attention_pair(perception: Perception, settings: dict):
     for eye in ("left", "right"):
         eye_started = time.perf_counter()
         try:
-            attention = Attention(perception, eye=eye, **arguments)
+            attention = Attention(
+                perception, eye=eye,
+                proposal_windows=region_result[eye], **arguments
+            )
             result[eye] = [candidate.copy() for candidate in attention.candidates]
             result[f"{eye}_elapsed"] = attention.elapsed_time
         except Exception:
             result[f"{eye}_elapsed"] = time.perf_counter() - eye_started
             result[f"{eye}_error"] = traceback.format_exc()
     result["elapsed_time"] = time.perf_counter() - started
+    result["region_diagnostics"] = region_result["diagnostics"]
+    result["region_visualizations"] = region_result["visualizations"]
     return result
 
 
@@ -98,12 +122,20 @@ class RuntimeConfig:
     partial_overlap_iou: float = 0.30
     candidate_crop_scale: float = 1.10
     attention_report_path: str = "debug/attention_report.html"
+    minimum_region_fraction: float = 0.03
+    region_growth_threshold: float = 14.0
+    minimum_merge_score: float = 0.65
+    stereo_merge_weight: float = 0.12
 
     def attention_settings(self):
         return {
             "minimum_objectness": self.minimum_objectness,
             "maximum_candidates": self.maximum_candidates_per_eye,
             "partial_overlap_iou": self.partial_overlap_iou,
+            "minimum_region_fraction": self.minimum_region_fraction,
+            "region_growth_threshold": self.region_growth_threshold,
+            "minimum_merge_score": self.minimum_merge_score,
+            "stereo_merge_weight": self.stereo_merge_weight,
         }
 
 
@@ -241,6 +273,7 @@ def candidate_details(candidate):
         "rank": int(candidate.get("rank", 0)),
         "window": [int(value) for value in candidate["window"]],
         "area_fraction": round(float(candidate.get("area_fraction", 0.0)), 5),
+        "source": str(candidate.get("source", "default")),
     }
     for key, _label in SCORE_FIELDS:
         value = candidate.get(key)
@@ -272,13 +305,23 @@ def write_attention_report(path, perception, result, identifier, jpeg_quality, c
                 "<article class='card'>"
                 f"<h3>#{details['rank']} — {window[0]}, {window[1]}, {window[2]}×{window[3]}</h3>"
                 f"<img src='{jpeg_data_uri(encode_jpeg(crop, jpeg_quality))}'>"
-                f"<table>{score_lines}<tr><th>area fraction</th><td>{details['area_fraction']:.5f}</td></tr></table>"
+                f"<table><tr><th>source</th><td>{html.escape(details['source'])}</td></tr>"
+                f"{score_lines}<tr><th>area fraction</th><td>{details['area_fraction']:.5f}</td></tr></table>"
                 "</article>"
             )
         sections.append(
             f"<section><h2>{title}: {len(candidates)} candidates</h2>"
             f"<img class='full' src='{jpeg_data_uri(full)}'><div class='cards'>{''.join(cards)}</div></section>"
         )
+    region_diagnostics = html.escape(json.dumps(
+        result.get("region_diagnostics", {}), ensure_ascii=False, indent=2
+    ))
+    visualizations = result.get("region_visualizations", {})
+    visualization_cards = "".join(
+        f"<article class='card'><h3>{html.escape(name.replace('_', ' '))}</h3>"
+        f"<img src='{jpeg_data_uri(encode_jpeg(image, jpeg_quality))}'></article>"
+        for name, image in visualizations.items()
+    )
     document = (
         "<!doctype html><html><head><meta charset='utf-8'><title>Babybot attention report</title>"
         "<style>body{font-family:sans-serif;background:#111;color:#eee;margin:24px}.full{max-width:900px;width:100%}"
@@ -287,7 +330,10 @@ def write_attention_report(path, perception, result, identifier, jpeg_quality, c
         "th,td{padding:3px;border-bottom:1px solid #444}</style></head><body>"
         f"<h1>Babybot attention report</h1><p>Perception {int(identifier)} | observation {int(perception.observation_id)} | "
         f"total {result['elapsed_time'] * 1000:.1f} ms | left {result['left_elapsed'] * 1000:.1f} ms | "
-        f"right {result['right_elapsed'] * 1000:.1f} ms</p>{''.join(sections)}</body></html>"
+        f"right {result['right_elapsed'] * 1000:.1f} ms</p>{''.join(sections)}"
+        f"<section><h2>Region proposal stages</h2><div class='cards'>{visualization_cards}</div>"
+        f"<h2>Region proposal diagnostics</h2><pre>{region_diagnostics}</pre></section>"
+        "</body></html>"
     )
     report_path = Path(path)
     report_path.parent.mkdir(parents=True, exist_ok=True)

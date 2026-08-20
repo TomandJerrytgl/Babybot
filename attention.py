@@ -330,6 +330,7 @@ class Attention:
         objectness_threshold=0.45,
         maximum_candidates=10,
         partial_overlap_iou=0.30,
+        proposal_windows=None,
     ):
         del object, previous_focus, previous_focus_age, hold_observations
         if eye not in ("left", "right"):
@@ -341,6 +342,7 @@ class Attention:
         self.objectness_threshold = float(objectness_threshold)
         self.maximum_candidates = int(maximum_candidates)
         self.partial_overlap_iou = float(partial_overlap_iou)
+        self.proposal_windows = tuple(proposal_windows or ())
         self.candidates = []
         self.elapsed_time = 0.0
         self.focus_source = "none"
@@ -354,6 +356,14 @@ class Attention:
         statistics = self.prepare_fixed_window_statistics(small)
         candidates_by_window = {}
         coarse_candidates = []
+        for window in self.proposal_windows:
+            window = self.clip_window(window, small.shape)
+            candidate = self.evaluate_fixed_window(
+                small, window, statistics, source="lab-region"
+            )
+            if candidate is not None:
+                candidates_by_window[window] = candidate
+                coarse_candidates.append(candidate)
         for window in self.coarse_adaptive_windows(small.shape):
             candidate = self.evaluate_fixed_window(small, window, statistics)
             if candidate is None:
@@ -376,7 +386,10 @@ class Attention:
                             current["window"], small.shape, adjustment=adjustment):
                         candidate = candidates_by_window.get(window)
                         if candidate is None:
-                            candidate = self.evaluate_fixed_window(small, window, statistics)
+                            candidate = self.evaluate_fixed_window(
+                                small, window, statistics,
+                                source=current.get("source", "default"),
+                            )
                             if candidate is not None:
                                 candidates_by_window[window] = candidate
                         if (candidate is not None
@@ -492,7 +505,7 @@ class Attention:
             - integral[y2, x1] + integral[y1, x1]
         )
 
-    def evaluate_fixed_window(self, image, window, statistics=None):
+    def evaluate_fixed_window(self, image, window, statistics=None, source="default"):
         """Score one box by boundary fit, color contrast, vividness and texture."""
         x, y, width, height = self.clip_window(window, image.shape)
         statistics = statistics or self.prepare_fixed_window_statistics(image)
@@ -653,7 +666,7 @@ class Attention:
             "objectness": objectness,
             "coherence": coherence,
             "appearance": float(np.clip(appearance, 0.0, 1.0)),
-            "source": "default",
+            "source": source,
             "ranking_score": ranking_score,
             "score": ranking_score,
         }
