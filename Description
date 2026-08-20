@@ -250,4 +250,9 @@ not read, modified or deleted.
 - The self-contained report overlays colored region boundaries and region IDs on the
   original perception for the initial, visual-merge and stereo-merge stages. Accepted
   and rejected merge tables expose every merge-score component and protection state.
+- Raw observation continues to refresh, but perception, region proposal and attention
+  are manual test captures. The browser's `Capture and calculate` button accepts one
+  task only; results remain frozen until another button press completes successfully.
+- The browser and report show a fully filled pseudocolor Lab label mask, the original
+  perception with colored boundaries, and the visual/stereo merged masks for each eye.
   It is self-contained, embeds all images, and never creates an automatic history.

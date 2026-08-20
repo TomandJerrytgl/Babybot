@@ -326,7 +326,7 @@ class StereoRegionProposer:
         return scores
 
     def visualize_labels(self, labels, regions, groups=None, base_image=None,
-                         depth_by_root=None):
+                         depth_by_root=None, fill_regions=False):
         """Draw clear colored boundaries over the original perception image."""
         roots = {}
         if groups:
@@ -346,11 +346,14 @@ class StereoRegionProposer:
             mask = np.isin(labels, tuple(members)).astype(np.uint8)
             aggregate = self._aggregate(regions, members)
             area = aggregate["area"]
+            if fill_regions:
+                output[mask.astype(bool)] = color
             contours, _hierarchy = cv2.findContours(
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
             thickness = 2 if area >= minimum_area else 1
-            cv2.drawContours(output, contours, -1, color, thickness, cv2.LINE_8)
+            outline_color = (12, 12, 12) if fill_regions else color
+            cv2.drawContours(output, contours, -1, outline_color, thickness, cv2.LINE_8)
             x, y, width, height = aggregate["bbox"]
             if area >= 120 or (width >= 18 and height >= 12):
                 protected_variation = .35 * aggregate["lab_std"][0] + .65 * math.hypot(
@@ -365,7 +368,9 @@ class StereoRegionProposer:
                     label += f" d{disparity:.1f}"
                 cv2.putText(
                     output, label, (x + 2, max(12, y + 12)),
-                    cv2.FONT_HERSHEY_SIMPLEX, .32, color, 1, cv2.LINE_AA,
+                    cv2.FONT_HERSHEY_SIMPLEX, .32,
+                    (255, 255, 255) if fill_regions else color,
+                    1, cv2.LINE_AA,
                 )
             if area >= minimum_area:
                 cv2.rectangle(output, (x, y), (x + width, y + height), color, 1)
@@ -411,13 +416,25 @@ class StereoRegionProposer:
             "regions": region_summaries,
             "visual_merges": first_diagnostics,
             "stereo_merges": second_diagnostics,
-        }, self.visualize_labels(
-            labels, regions, base_image=base_image
-        ), self.visualize_labels(
-            labels, regions, visual_groups, base_image, depth_by_root
-        ), self.visualize_labels(
-            labels, regions, groups, base_image, depth_by_root
-        )
+        }, {
+            "initial_mask": self.visualize_labels(
+                labels, regions, fill_regions=True
+            ),
+            "initial_overlay": self.visualize_labels(
+                labels, regions, base_image=base_image
+            ),
+            "visual_merged_mask": self.visualize_labels(
+                labels, regions, visual_groups, depth_by_root=depth_by_root,
+                fill_regions=True,
+            ),
+            "stereo_merged_mask": self.visualize_labels(
+                labels, regions, groups, depth_by_root=depth_by_root,
+                fill_regions=True,
+            ),
+            "stereo_merged_overlay": self.visualize_labels(
+                labels, regions, groups, base_image, depth_by_root
+            ),
+        }
 
     def propose(self, left, right):
         left_labels, left_regions, left_edges = self.grow_regions(left)
@@ -435,10 +452,10 @@ class StereoRegionProposer:
             left_disparity = None
             right_disparity = None
             disparity_error = str(error)
-        left_windows, left_diagnostics, left_initial, left_visual, left_final = self.propose_eye(
+        left_windows, left_diagnostics, left_views = self.propose_eye(
             left_labels, left_regions, left_edges, left_disparity, left
         )
-        right_windows, right_diagnostics, right_initial, right_visual, right_final = self.propose_eye(
+        right_windows, right_diagnostics, right_views = self.propose_eye(
             right_labels, right_regions, right_edges, right_disparity, right
         )
         return {
@@ -451,11 +468,8 @@ class StereoRegionProposer:
                 "right": right_diagnostics,
             },
             "visualizations": {
-                "left_initial": left_initial,
-                "left_visual_merged": left_visual,
-                "left_stereo_merged": left_final,
-                "right_initial": right_initial,
-                "right_visual_merged": right_visual,
-                "right_stereo_merged": right_final,
+                f"{eye}_{name}": image
+                for eye, views in (("left", left_views), ("right", right_views))
+                for name, image in views.items()
             },
         }

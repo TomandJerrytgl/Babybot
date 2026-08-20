@@ -39,14 +39,28 @@ class RegionProposalTests(unittest.TestCase):
         image = np.full((200, 320, 3), 120, np.uint8)
         image[20:40, 20:40] = (20, 80, 220)
         labels, regions, edges = self.proposer.grow_regions(image)
-        windows, diagnostics, initial, visual, final = self.proposer.propose_eye(
+        windows, diagnostics, views = self.proposer.propose_eye(
             labels, regions, edges, None
         )
         self.assertTrue(all(width * height >= 1920 for _x, _y, width, height in windows))
         self.assertEqual(diagnostics["initial_region_count"], len(regions))
-        self.assertEqual(initial.shape, image.shape)
-        self.assertEqual(visual.shape, image.shape)
-        self.assertEqual(final.shape, image.shape)
+        self.assertEqual(set(views), {
+            "initial_mask", "initial_overlay", "visual_merged_mask",
+            "stereo_merged_mask", "stereo_merged_overlay",
+        })
+        self.assertTrue(all(view.shape == image.shape for view in views.values()))
+
+    def test_initial_mask_fills_regions_with_distinct_pseudocolors(self):
+        image = np.zeros((60, 100, 3), np.uint8)
+        image[:, :50] = (20, 40, 220)
+        image[:, 50:] = (220, 60, 20)
+        labels, regions, edges = self.proposer.grow_regions(image)
+        _windows, _diagnostics, views = self.proposer.propose_eye(
+            labels, regions, edges, None, image
+        )
+        mask = views["initial_mask"]
+        self.assertFalse(np.array_equal(mask, image))
+        self.assertFalse(np.array_equal(mask[30, 20], mask[30, 80]))
 
     def test_merge_diagnostics_expose_every_score_component(self):
         first = {"area": 500, "lab_mean": np.array([100, 130, 130]),

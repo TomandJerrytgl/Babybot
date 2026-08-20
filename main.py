@@ -147,7 +147,32 @@ class PreviewStore:
         self._images = {}
         self._identifiers = {}
         self._candidate_images = {}
-        self._attention_status = {"ready": False, "message": "Waiting for first attention result"}
+        self._region_images = {}
+        self._attention_status = {
+            "ready": False, "calculating": False, "trigger_pending": False,
+            "message": "Press Capture and calculate to create the first result",
+        }
+
+    def request_capture(self):
+        with self._lock:
+            if (self._attention_status.get("calculating")
+                    or self._attention_status.get("trigger_pending")):
+                return False
+            self._attention_status["trigger_pending"] = True
+            self._attention_status["message"] = "Capture requested"
+            return True
+
+    def begin_capture(self):
+        with self._lock:
+            self._attention_status["trigger_pending"] = False
+            self._attention_status["calculating"] = True
+            self._attention_status["message"] = "Calculating perception and attention"
+
+    def fail_capture(self, message):
+        with self._lock:
+            self._attention_status["trigger_pending"] = False
+            self._attention_status["calculating"] = False
+            self._attention_status["message"] = str(message)
 
     def update(self, kind, left, right, left_candidates, right_candidates, identifier, jpeg_quality):
         if kind not in ("observation", "perception"):
@@ -164,6 +189,10 @@ class PreviewStore:
         left_jpeg = encode_preview(perception.left, result["left"], jpeg_quality)
         right_jpeg = encode_preview(perception.right, result["right"], jpeg_quality)
         candidate_images = {}
+        region_images = {
+            name: encode_jpeg(image, jpeg_quality)
+            for name, image in result.get("region_visualizations", {}).items()
+        }
         for eye in ("left", "right"):
             image = getattr(perception, eye)
             for candidate in result[eye]:
@@ -171,6 +200,9 @@ class PreviewStore:
                 candidate_images[(eye, candidate["rank"])] = encode_jpeg(crop, jpeg_quality)
         status = {
             "ready": True,
+            "calculating": False,
+            "trigger_pending": False,
+            "message": "Result ready; press Capture and calculate for the next result",
             "perception_id": int(identifier),
             "observation_id": int(perception.observation_id),
             "timestamp": float(perception.timestamp),
@@ -187,6 +219,7 @@ class PreviewStore:
             self._images[("perception", "right")] = right_jpeg
             self._identifiers["perception"] = int(identifier)
             self._candidate_images = candidate_images
+            self._region_images = region_images
             self._attention_status = status
 
     def get(self, kind, eye):
@@ -196,6 +229,10 @@ class PreviewStore:
     def get_candidate(self, eye, rank):
         with self._lock:
             return self._candidate_images.get((eye, int(rank))), self._identifiers.get("perception", -1)
+
+    def get_region(self, name):
+        with self._lock:
+            return self._region_images.get(name), self._identifiers.get("perception", -1)
 
     def attention_status(self):
         with self._lock:
@@ -393,7 +430,8 @@ def write_attention_report(path, perception, result, identifier, jpeg_quality, c
     temporary.replace(report_path)
 
 
-def make_request_handler(previews, report_path="debug/attention_report.html"):
+def make_request_handler(previews, report_path="debug/attention_report.html",
+                         request_capture=None):
     class PreviewHandler(BaseHTTPRequestHandler):
         def do_GET(self):
             path = self.path.split("?", 1)[0]
@@ -403,12 +441,21 @@ def make_request_handler(previews, report_path="debug/attention_report.html"):
                     "<title>Babybot visual front end</title><style>body{background:#111;color:#eee;font-family:sans-serif;margin:20px}"
                     ".eyes{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}img{width:100%;height:auto;background:#222}"
                     ".cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}.card{background:#222;padding:10px}"
-                    "pre{white-space:pre-wrap;font-size:12px}h1,h2{font-weight:500}</style></head><body><h1>Babybot visual front end</h1>"
+                    "pre{white-space:pre-wrap;font-size:12px}h1,h2{font-weight:500}button{font-size:18px;padding:12px 20px;cursor:pointer}"
+                    "button:disabled{opacity:.55;cursor:wait}</style></head><body><h1>Babybot visual front end</h1>"
                     "<h2>Raw observation — target 20 Hz — no overlay</h2><div class='eyes'><section><h3>Left eye</h3><img id='observation-left'></section>"
-                    "<section><h3>Right eye</h3><img id='observation-right'></section></div><h2>Perception + Attention — event driven — 320×200</h2>"
-                    "<p id='timing'>Waiting for first attention result</p><p><a href='/report/attention' target='_blank'>Open latest self-contained report</a></p>"
+                    "<section><h3>Right eye</h3><img id='observation-right'></section></div>"
+                    "<p><button id='capture'>Capture and calculate</button></p>"
+                    "<h2>Perception + Attention — manually captured — 320×200</h2>"
+                    "<p id='timing'>Press Capture and calculate</p><p><a href='/report/attention' target='_blank'>Open latest self-contained report</a></p>"
                     "<div class='eyes'><section><h3>Left eye</h3><img id='perception-left'></section><section><h3>Right eye</h3>"
-                    "<img id='perception-right'></section></div><h2>Left candidates</h2><div id='left-candidates' class='cards'></div>"
+                    "<img id='perception-right'></section></div>"
+                    "<h2>Initial Lab region mask</h2><div class='eyes'><img id='region-left-initial_mask'><img id='region-right-initial_mask'></div>"
+                    "<h2>Original perception + Lab boundaries</h2><div class='eyes'><img id='region-left-initial_overlay'><img id='region-right-initial_overlay'></div>"
+                    "<h2>Visual merged region mask</h2><div class='eyes'><img id='region-left-visual_merged_mask'><img id='region-right-visual_merged_mask'></div>"
+                    "<h2>Stereo merged region mask</h2><div class='eyes'><img id='region-left-stereo_merged_mask'><img id='region-right-stereo_merged_mask'></div>"
+                    "<h2>Stereo merged boundaries</h2><div class='eyes'><img id='region-left-stereo_merged_overlay'><img id='region-right-stereo_merged_overlay'></div>"
+                    "<h2>Left candidates</h2><div id='left-candidates' class='cards'></div>"
                     "<h2>Right candidates</h2><div id='right-candidates' class='cards'></div><script>"
                     "function refresh(k,d){let p=2,l=document.getElementById(k+'-left'),r=document.getElementById(k+'-right');"
                     "const done=()=>{if(--p===0)setTimeout(()=>refresh(k,d),d)};l.onload=l.onerror=done;r.onload=r.onerror=done;"
@@ -417,10 +464,17 @@ def make_request_handler(previews, report_path="debug/attention_report.html"):
                     "let a=document.createElement('article');a.className='card';let h=document.createElement('h3');h.textContent='#'+c.rank+' window '+c.window.join(', ');"
                     "let i=document.createElement('img');i.src='/candidate/'+eye+'/'+c.rank+'.jpg?t='+id;let p=document.createElement('pre');"
                     "p.textContent=JSON.stringify(c,null,2);a.append(h,i,p);root.append(a)})}"
-                    "async function status(){try{let r=await fetch('/status/attention.json?t='+Date.now()),s=await r.json();if(s.ready){"
-                    "document.getElementById('timing').textContent='Perception '+s.perception_id+' | left '+s.left_elapsed_ms+' ms | right '+s.right_elapsed_ms+' ms | total '+s.total_elapsed_ms+' ms';"
-                    "cards('left',s.left,s.perception_id);cards('right',s.right,s.perception_id)}}catch(e){}setTimeout(status,300)}"
-                    "refresh('observation',50);refresh('perception',150);status()</script></body></html>"
+                    "let shown=-1;function showResult(s){let id=s.perception_id,t=Date.now();['left','right'].forEach(e=>{"
+                    "document.getElementById('perception-'+e).src='/frame/perception/'+e+'.jpg?t='+t;"
+                    "['initial_mask','initial_overlay','visual_merged_mask','stereo_merged_mask','stereo_merged_overlay'].forEach(k=>{"
+                    "document.getElementById('region-'+e+'-'+k).src='/region/'+e+'_'+k+'.jpg?t='+t})});"
+                    "cards('left',s.left,id);cards('right',s.right,id);shown=id}"
+                    "async function status(){try{let r=await fetch('/status/attention.json?t='+Date.now()),s=await r.json(),b=document.getElementById('capture');"
+                    "b.disabled=!!(s.calculating||s.trigger_pending);document.getElementById('timing').textContent=s.message||'Waiting';"
+                    "if(s.ready&&s.perception_id!==shown){showResult(s);document.getElementById('timing').textContent='Perception '+s.perception_id+' | left '+s.left_elapsed_ms+' ms | right '+s.right_elapsed_ms+' ms | total '+s.total_elapsed_ms+' ms'}}catch(e){}setTimeout(status,300)}"
+                    "document.getElementById('capture').onclick=async()=>{let b=document.getElementById('capture');b.disabled=true;"
+                    "try{await fetch('/action/capture',{method:'POST'})}catch(e){b.disabled=false}};"
+                    "refresh('observation',50);status()</script></body></html>"
                 ).encode("utf-8")
                 self._send_bytes(body, "text/html; charset=utf-8")
                 return
@@ -432,7 +486,8 @@ def make_request_handler(previews, report_path="debug/attention_report.html"):
                 return
             if path == "/report/attention":
                 file_path = Path(report_path)
-                if not file_path.is_file():
+                if (not previews.attention_status().get("ready")
+                        or not file_path.is_file()):
                     self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "Waiting for first attention report")
                     return
                 self._send_bytes(file_path.read_bytes(), "text/html; charset=utf-8", no_store=True)
@@ -452,7 +507,29 @@ def make_request_handler(previews, report_path="debug/attention_report.html"):
                 image, identifier = previews.get_candidate(parts[1], rank)
                 self._send_image_or_wait(image, identifier)
                 return
+            if len(parts) == 2 and parts[0] == "region" and parts[1].endswith(".jpg"):
+                image, identifier = previews.get_region(parts[1][:-4])
+                self._send_image_or_wait(image, identifier)
+                return
             self.send_error(HTTPStatus.NOT_FOUND, html.escape(path))
+
+        def do_POST(self):
+            path = self.path.split("?", 1)[0]
+            if path != "/action/capture":
+                self.send_error(HTTPStatus.NOT_FOUND, html.escape(path))
+                return
+            if request_capture is None:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "Capture control unavailable")
+                return
+            if not request_capture():
+                self.send_error(HTTPStatus.CONFLICT, "Capture already pending or calculating")
+                return
+            body = b'{"accepted":true}'
+            self.send_response(HTTPStatus.ACCEPTED)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def _send_image_or_wait(self, image, identifier):
             if image is None:
@@ -487,6 +564,7 @@ class BabybotRuntime:
         self.previews = PreviewStore()
         self.latest_frames = LatestStereoFrame()
         self.stop_event = threading.Event()
+        self.capture_request_event = threading.Event()
         self.left_camera = None
         self.right_camera = None
         self.web_server: Optional[ThreadingHTTPServer] = None
@@ -517,6 +595,13 @@ class BabybotRuntime:
     def request_stop(self, *_args):
         LOGGER.info("Stop requested")
         self.stop_event.set()
+        self.capture_request_event.set()
+
+    def request_attention_capture(self):
+        if not self.previews.request_capture():
+            return False
+        self.capture_request_event.set()
+        return True
 
     def _open_camera(self, index):
         camera = cv2.VideoCapture(index, cv2.CAP_V4L2)
@@ -575,9 +660,15 @@ class BabybotRuntime:
         perception_id = 0
         settings = self.config.attention_settings()
         while not self.stop_event.is_set():
+            if not self.capture_request_event.wait(0.1):
+                continue
+            self.capture_request_event.clear()
+            if self.stop_event.is_set():
+                break
+            self.previews.begin_capture()
             snapshot = self.latest_frames.snapshot()
             if snapshot is None:
-                self.stop_event.wait(0.01)
+                self.previews.fail_capture("No camera frame is available yet")
                 continue
             left, right, _version = snapshot
             observation = Observation.from_frames(
@@ -621,6 +712,9 @@ class BabybotRuntime:
                 perception_id += 1
             except Exception:
                 LOGGER.exception("Attention calculation failed")
+                self.previews.fail_capture(
+                    "Calculation failed; previous successful result was retained"
+                )
 
     def _observation_preview_loop(self):
         interval = 1.0 / self.config.observation_preview_fps
@@ -635,7 +729,10 @@ class BabybotRuntime:
             self.stop_event.wait(max(0.0, interval - (time.monotonic() - started)))
 
     def _start_web_server(self):
-        handler = make_request_handler(self.previews, self.config.attention_report_path)
+        handler = make_request_handler(
+            self.previews, self.config.attention_report_path,
+            self.request_attention_capture,
+        )
         self.web_server = ThreadingHTTPServer((self.config.web_host, self.config.web_port), handler)
         self.web_thread = threading.Thread(
             target=self.web_server.serve_forever, name="preview-web", daemon=True
@@ -655,6 +752,7 @@ class BabybotRuntime:
 
     def shutdown(self):
         self.stop_event.set()
+        self.capture_request_event.set()
         self.attention_pool.shutdown(wait=True, cancel_futures=True)
         for worker in (self.capture_thread, self.observation_preview_thread):
             if worker is not None and worker is not threading.current_thread():

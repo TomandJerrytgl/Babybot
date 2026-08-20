@@ -3,7 +3,7 @@ import tempfile
 import time
 import unittest
 from urllib.error import HTTPError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import cv2
 import numpy as np
@@ -409,7 +409,9 @@ class WebPreviewTests(unittest.TestCase):
         self.store = PreviewStore()
         self.temporary = tempfile.TemporaryDirectory()
         self.report_path = f"{self.temporary.name}/attention_report.html"
-        handler = make_request_handler(self.store, self.report_path)
+        handler = make_request_handler(
+            self.store, self.report_path, self.store.request_capture
+        )
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -436,6 +438,8 @@ class WebPreviewTests(unittest.TestCase):
         page = urlopen(self.base_url + "/", timeout=2).read().decode("utf-8")
         self.assertIn("Raw observation", page)
         self.assertIn("Perception", page)
+        self.assertIn("Capture and calculate", page)
+        self.assertIn("Initial Lab region mask", page)
         response = urlopen(self.base_url + "/frame/observation/right.jpg", timeout=2)
         body = response.read()
         self.assertEqual(response.headers["X-Frame-Id"], "7")
@@ -451,6 +455,33 @@ class WebPreviewTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as context:
             urlopen(self.base_url + "/frame/observation/left.jpg", timeout=2)
         self.assertEqual(context.exception.code, 503)
+
+    def test_manual_capture_rejects_duplicate_request(self):
+        request = Request(self.base_url + "/action/capture", method="POST")
+        response = urlopen(request, timeout=2)
+        self.assertEqual(response.status, 202)
+        status = self.store.attention_status()
+        self.assertTrue(status["trigger_pending"])
+        with self.assertRaises(HTTPError) as context:
+            urlopen(Request(self.base_url + "/action/capture", method="POST"), timeout=2)
+        self.assertEqual(context.exception.code, 409)
+
+    def test_failed_capture_retains_previous_ready_result(self):
+        image = np.zeros((32, 48, 3), dtype=np.uint8)
+        item = Perception.from_observation(
+            Observation(3, 1.0, 1.0, image, image.copy()), width=48, height=32
+        )
+        self.store.update_attention(
+            item, {"left": [], "right": [], "left_elapsed": .1,
+                   "right_elapsed": .2, "elapsed_time": .3},
+            3, 80, 1.10,
+        )
+        self.store.begin_capture()
+        self.store.fail_capture("test failure")
+        status = self.store.attention_status()
+        self.assertTrue(status["ready"])
+        self.assertFalse(status["calculating"])
+        self.assertEqual(status["perception_id"], 3)
 
 
 if __name__ == "__main__":
