@@ -188,7 +188,8 @@ class VisualFrontEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = f"{directory}/attention_report.html"
             write_attention_report(path, perception, result, 4, 80, 1.10)
-            report = open(path, encoding="utf-8").read()
+            with open(path, encoding="utf-8") as report_file:
+                report = report_file.read()
         self.assertIn("data:image/jpeg;base64,", report)
         self.assertIn("objectness", report)
 
