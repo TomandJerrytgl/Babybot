@@ -247,4 +247,7 @@ not read, modified or deleted.
   conservatively merged through color, boundary, interface-scale, fill and shape
   evidence. Uncalibrated left-view disparity contributes only 12% when valid; missing
   depth remains neutral. Existing multiscale windows remain available as a fallback.
+- The self-contained report overlays colored region boundaries and region IDs on the
+  original perception for the initial, visual-merge and stereo-merge stages. Accepted
+  and rejected merge tables expose every merge-score component and protection state.
   It is self-contained, embeds all images, and never creates an automatic history.

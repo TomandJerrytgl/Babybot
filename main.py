@@ -285,6 +285,54 @@ def jpeg_data_uri(data):
     return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
 
 
+def merge_diagnostics_html(region_diagnostics):
+    """Render accepted and rejected region merges as inspectable score tables."""
+    score_fields = (
+        "merge_score", "color_similarity", "weak_boundary",
+        "scale_compatibility", "merged_fill", "shape_continuity",
+        "small_region_preference", "depth_similarity",
+    )
+    headers = "".join(f"<th>{html.escape(field)}</th>" for field in score_fields)
+    sections = []
+    for eye in ("left", "right"):
+        eye_data = region_diagnostics.get(eye, {})
+        records = list(eye_data.get("visual_merges", [])) + list(
+            eye_data.get("stereo_merges", [])
+        )
+        for accepted, title in ((True, "Accepted merges"), (False, "Rejected merges")):
+            selected = [item for item in records if bool(item.get("accepted")) is accepted]
+            if accepted:
+                selected.sort(key=lambda item: (item.get("stage", ""), item.get("order", 0)))
+            else:
+                selected.sort(key=lambda item: item.get("merge_score", 0.0), reverse=True)
+            rows = []
+            for item in selected:
+                values = "".join(
+                    f"<td>{'—' if item.get(field) is None else f'{float(item[field]):.4f}'}</td>"
+                    for field in score_fields
+                )
+                rows.append(
+                    f"<tr><td>{html.escape(str(item.get('stage', '')))}</td>"
+                    f"<td>{int(item.get('order', 0))}</td>"
+                    f"<td>{html.escape(str(item.get('component_a', item.get('regions', []))))}</td>"
+                    f"<td>{html.escape(str(item.get('component_b', [])))}</td>"
+                    f"<td>{html.escape(str(item.get('protected', [])))}</td>{values}</tr>"
+                )
+            table = (
+                "<div class='table-wrap'><table><thead><tr><th>stage</th><th>order</th>"
+                f"<th>component A</th><th>component B</th><th>protected</th>{headers}"
+                f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+            )
+            if accepted:
+                sections.append(f"<h3>{eye.title()} eye — {title} ({len(selected)})</h3>{table}")
+            else:
+                sections.append(
+                    f"<details><summary>{eye.title()} eye — {title} ({len(selected)})</summary>"
+                    f"{table}</details>"
+                )
+    return "".join(sections)
+
+
 def write_attention_report(path, perception, result, identifier, jpeg_quality, crop_scale):
     """Atomically replace one self-contained HTML report for the latest result."""
     sections = []
@@ -316,6 +364,7 @@ def write_attention_report(path, perception, result, identifier, jpeg_quality, c
     region_diagnostics = html.escape(json.dumps(
         result.get("region_diagnostics", {}), ensure_ascii=False, indent=2
     ))
+    merge_tables = merge_diagnostics_html(result.get("region_diagnostics", {}))
     visualizations = result.get("region_visualizations", {})
     visualization_cards = "".join(
         f"<article class='card'><h3>{html.escape(name.replace('_', ' '))}</h3>"
@@ -327,12 +376,14 @@ def write_attention_report(path, perception, result, identifier, jpeg_quality, c
         "<style>body{font-family:sans-serif;background:#111;color:#eee;margin:24px}.full{max-width:900px;width:100%}"
         ".cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}.card{background:#222;padding:12px}"
         ".card img{width:100%;height:auto}table{width:100%;border-collapse:collapse}th{text-align:left}"
-        "th,td{padding:3px;border-bottom:1px solid #444}</style></head><body>"
+        "th,td{padding:3px;border-bottom:1px solid #444;white-space:nowrap}.table-wrap{overflow:auto;max-height:620px}"
+        "details{margin:16px 0}summary{cursor:pointer;font-size:1.1rem}</style></head><body>"
         f"<h1>Babybot attention report</h1><p>Perception {int(identifier)} | observation {int(perception.observation_id)} | "
         f"total {result['elapsed_time'] * 1000:.1f} ms | left {result['left_elapsed'] * 1000:.1f} ms | "
         f"right {result['right_elapsed'] * 1000:.1f} ms</p>{''.join(sections)}"
         f"<section><h2>Region proposal stages</h2><div class='cards'>{visualization_cards}</div>"
-        f"<h2>Region proposal diagnostics</h2><pre>{region_diagnostics}</pre></section>"
+        f"<h2>Merge score details</h2>{merge_tables}"
+        f"<details><summary>Raw region diagnostics JSON</summary><pre>{region_diagnostics}</pre></details></section>"
         "</body></html>"
     )
     report_path = Path(path)

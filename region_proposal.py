@@ -195,7 +195,8 @@ class StereoRegionProposer:
             "merge_score": score,
         }
 
-    def merge_pass(self, regions, graph, image_shape, depth_by_pair=None):
+    def merge_pass(self, regions, graph, image_shape, depth_by_pair=None,
+                   stage="visual"):
         image_area = image_shape[0] * image_shape[1]
         sets = _DisjointSet(len(regions))
         members = {index: {index} for index in range(len(regions))}
@@ -229,7 +230,11 @@ class StereoRegionProposer:
                 if first_protected or second_protected:
                     accepted = accepted and scores["merge_score"] >= .78
                 diagnostics.append({
+                    "stage": stage,
+                    "order": len(diagnostics) + 1,
                     "regions": [int(raw_a), int(raw_b)], "accepted": bool(accepted),
+                    "component_a": sorted(int(value) for value in members[a]),
+                    "component_b": sorted(int(value) for value in members[b]),
                     "protected": [bool(first_protected), bool(second_protected)],
                     **{key: None if value is None else round(float(value), 4)
                        for key, value in scores.items()},
@@ -320,28 +325,62 @@ class StereoRegionProposer:
                 )
         return scores
 
-    @staticmethod
-    def visualize_labels(labels, groups=None):
+    def visualize_labels(self, labels, regions, groups=None, base_image=None,
+                         depth_by_root=None):
+        """Draw clear colored boundaries over the original perception image."""
         roots = {}
         if groups:
             for root, members in groups.items():
                 for member in members:
                     roots[member] = root
-        output = np.zeros((*labels.shape, 3), np.uint8)
-        for identifier in np.unique(labels):
-            root = roots.get(int(identifier), int(identifier))
+        else:
+            groups = {int(identifier): {int(identifier)} for identifier in np.unique(labels)}
+        output = (base_image.copy() if base_image is not None
+                  else np.full((*labels.shape, 3), 32, np.uint8))
+        image_area = labels.shape[0] * labels.shape[1]
+        minimum_area = image_area * self.config.minimum_region_fraction
+        for root, members in groups.items():
             color = ((root * 67 + 47) % 220 + 25,
                      (root * 113 + 31) % 220 + 25,
                      (root * 173 + 19) % 220 + 25)
-            output[labels == identifier] = color
+            mask = np.isin(labels, tuple(members)).astype(np.uint8)
+            aggregate = self._aggregate(regions, members)
+            area = aggregate["area"]
+            contours, _hierarchy = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            thickness = 2 if area >= minimum_area else 1
+            cv2.drawContours(output, contours, -1, color, thickness, cv2.LINE_8)
+            x, y, width, height = aggregate["bbox"]
+            if area >= 120 or (width >= 18 and height >= 12):
+                protected_variation = .35 * aggregate["lab_std"][0] + .65 * math.hypot(
+                    aggregate["lab_std"][1], aggregate["lab_std"][2]
+                )
+                state = "P" if area >= minimum_area and protected_variation <= 12.0 else (
+                    "C" if area >= minimum_area else "S"
+                )
+                disparity = None if not depth_by_root else depth_by_root.get(root)
+                label = f"R{root} {state} {area/image_area:.1%}"
+                if disparity is not None:
+                    label += f" d{disparity:.1f}"
+                cv2.putText(
+                    output, label, (x + 2, max(12, y + 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, .32, color, 1, cv2.LINE_AA,
+                )
+            if area >= minimum_area:
+                cv2.rectangle(output, (x, y), (x + width, y + height), color, 1)
         return output
 
-    def propose_eye(self, labels, regions, edges, disparity=None):
+    def propose_eye(self, labels, regions, edges, disparity=None, base_image=None):
         graph = self.adjacency(labels, edges)
-        groups, first_diagnostics = self.merge_pass(regions, graph, labels.shape)
+        groups, first_diagnostics = self.merge_pass(
+            regions, graph, labels.shape, stage="visual"
+        )
+        visual_groups = {root: set(members) for root, members in groups.items()}
         depth_by_pair = self.interface_depth_scores(labels, graph, disparity)
         groups, second_diagnostics = self.merge_pass(
-            regions, graph, labels.shape, depth_by_pair=depth_by_pair
+            regions, graph, labels.shape, depth_by_pair=depth_by_pair,
+            stage="stereo",
         )
         depth_by_root = self.region_disparities(labels, groups, disparity) if disparity is not None else {}
         image_area = labels.shape[0] * labels.shape[1]
@@ -372,7 +411,13 @@ class StereoRegionProposer:
             "regions": region_summaries,
             "visual_merges": first_diagnostics,
             "stereo_merges": second_diagnostics,
-        }, self.visualize_labels(labels), self.visualize_labels(labels, groups)
+        }, self.visualize_labels(
+            labels, regions, base_image=base_image
+        ), self.visualize_labels(
+            labels, regions, visual_groups, base_image, depth_by_root
+        ), self.visualize_labels(
+            labels, regions, groups, base_image, depth_by_root
+        )
 
     def propose(self, left, right):
         left_labels, left_regions, left_edges = self.grow_regions(left)
@@ -390,11 +435,11 @@ class StereoRegionProposer:
             left_disparity = None
             right_disparity = None
             disparity_error = str(error)
-        left_windows, left_diagnostics, left_initial, left_final = self.propose_eye(
-            left_labels, left_regions, left_edges, left_disparity
+        left_windows, left_diagnostics, left_initial, left_visual, left_final = self.propose_eye(
+            left_labels, left_regions, left_edges, left_disparity, left
         )
-        right_windows, right_diagnostics, right_initial, right_final = self.propose_eye(
-            right_labels, right_regions, right_edges, right_disparity
+        right_windows, right_diagnostics, right_initial, right_visual, right_final = self.propose_eye(
+            right_labels, right_regions, right_edges, right_disparity, right
         )
         return {
             "left": left_windows,
@@ -406,7 +451,11 @@ class StereoRegionProposer:
                 "right": right_diagnostics,
             },
             "visualizations": {
-                "left_initial": left_initial, "left_final": left_final,
-                "right_initial": right_initial, "right_final": right_final,
+                "left_initial": left_initial,
+                "left_visual_merged": left_visual,
+                "left_stereo_merged": left_final,
+                "right_initial": right_initial,
+                "right_visual_merged": right_visual,
+                "right_stereo_merged": right_final,
             },
         }

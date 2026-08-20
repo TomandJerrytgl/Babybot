@@ -39,11 +39,28 @@ class RegionProposalTests(unittest.TestCase):
         image = np.full((200, 320, 3), 120, np.uint8)
         image[20:40, 20:40] = (20, 80, 220)
         labels, regions, edges = self.proposer.grow_regions(image)
-        windows, diagnostics, _initial, _final = self.proposer.propose_eye(
+        windows, diagnostics, initial, visual, final = self.proposer.propose_eye(
             labels, regions, edges, None
         )
         self.assertTrue(all(width * height >= 1920 for _x, _y, width, height in windows))
         self.assertEqual(diagnostics["initial_region_count"], len(regions))
+        self.assertEqual(initial.shape, image.shape)
+        self.assertEqual(visual.shape, image.shape)
+        self.assertEqual(final.shape, image.shape)
+
+    def test_merge_diagnostics_expose_every_score_component(self):
+        first = {"area": 500, "lab_mean": np.array([100, 130, 130]),
+                 "bbox": (20, 20, 50, 10)}
+        second = {"area": 600, "lab_mean": np.array([105, 132, 128]),
+                  "bbox": (20, 30, 52, 12)}
+        boundary = {"shared": 48, "horizontal": 48, "vertical": 0,
+                    "edge_sum": 6.0}
+        scores = self.proposer.merge_features(first, second, boundary, 64000, .8)
+        self.assertEqual(set(scores), {
+            "color_similarity", "weak_boundary", "scale_compatibility",
+            "merged_fill", "shape_continuity", "small_region_preference",
+            "depth_similarity", "merge_score",
+        })
 
 
 if __name__ == "__main__":

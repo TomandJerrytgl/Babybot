@@ -24,6 +24,7 @@ from main import (
     encode_preview,
     make_request_handler,
     make_candidate_crop,
+    merge_diagnostics_html,
     write_attention_report,
 )
 from observation import Observation
@@ -205,6 +206,24 @@ class VisualFrontEndTests(unittest.TestCase):
         self.assertIn("data:image/jpeg;base64,", report)
         self.assertIn("objectness", report)
         self.assertIn("Lab contrast — top", report)
+
+    def test_merge_diagnostics_table_separates_accepted_and_rejected(self):
+        record = {
+            "stage": "visual", "order": 1, "component_a": [1],
+            "component_b": [2], "protected": [False, False],
+            "color_similarity": .9, "weak_boundary": .8,
+            "scale_compatibility": .7, "merged_fill": .6,
+            "shape_continuity": .5, "small_region_preference": 1.0,
+            "depth_similarity": None, "merge_score": .75,
+        }
+        diagnostics = {"left": {
+            "visual_merges": [{**record, "accepted": True}],
+            "stereo_merges": [{**record, "order": 2, "accepted": False}],
+        }}
+        rendered = merge_diagnostics_html(diagnostics)
+        self.assertIn("Accepted merges (1)", rendered)
+        self.assertIn("Rejected merges (1)", rendered)
+        self.assertIn("scale_compatibility", rendered)
 
 
 class AttentionValidatorTests(unittest.TestCase):
