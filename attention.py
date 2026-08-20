@@ -328,7 +328,6 @@ class Attention:
         analysis_width=320,
         hold_observations=10,
         objectness_threshold=0.45,
-        minimum_attention_score=0.25,
         maximum_candidates=10,
         partial_overlap_iou=0.30,
     ):
@@ -340,7 +339,6 @@ class Attention:
         self.verbose = verbose
         self.analysis_width = int(analysis_width)
         self.objectness_threshold = float(objectness_threshold)
-        self.minimum_attention_score = float(minimum_attention_score)
         self.maximum_candidates = int(maximum_candidates)
         self.partial_overlap_iou = float(partial_overlap_iou)
         self.candidates = []
@@ -367,7 +365,7 @@ class Attention:
         # Every side can move independently, so the result is not restricted to
         # one of the coarse sizes or aspect ratios.
         refinement_seeds = sorted(
-            coarse_candidates, key=lambda item: item["score"], reverse=True
+            coarse_candidates, key=lambda item: item["objectness"], reverse=True
         )[:12]
         for seed in refinement_seeds:
             current = seed
@@ -381,7 +379,8 @@ class Attention:
                             candidate = self.evaluate_fixed_window(small, window, statistics)
                             if candidate is not None:
                                 candidates_by_window[window] = candidate
-                        if candidate is not None and candidate["score"] > improved["score"]:
+                        if (candidate is not None
+                                and candidate["objectness"] > improved["objectness"]):
                             improved = candidate
                     if improved is current:
                         break
@@ -389,8 +388,7 @@ class Attention:
 
         candidates = []
         for candidate in candidates_by_window.values():
-            if (candidate["score"] < self.minimum_attention_score
-                    or candidate["objectness"] < self.objectness_threshold):
+            if candidate["objectness"] < self.objectness_threshold:
                 continue
             window = candidate["window"]
             mapped = self.map_window(window, scale_x, scale_y, image.shape)
@@ -499,15 +497,7 @@ class Attention:
         x, y, width, height = self.clip_window(window, image.shape)
         statistics = statistics or self.prepare_fixed_window_statistics(image)
 
-        margin = max(4, int(round(max(width, height) * 0.15)))
-        cx1, cy1 = max(0, x - margin), max(0, y - margin)
-        cx2 = min(image.shape[1], x + width + margin)
-        cy2 = min(image.shape[0], y + height + margin)
         patch_area = width * height
-        context_area = (cx2 - cx1) * (cy2 - cy1)
-        ring_area = context_area - patch_area
-        if ring_area < 20:
-            return None
 
         vividness = self._rectangle_sum(
             statistics["vividness"], x, y, x + width, y + height
@@ -531,14 +521,12 @@ class Attention:
             + self._rectangle_sum(edge_integral, x + width - band, y + band, x + width, y + height - band)
         )
         boundary_area = max(1, 2 * band * (width + height - 2 * band))
-        boundary_fit = float(np.clip(boundary_sum / (boundary_area * 255.0 * 0.18), 0.0, 1.0))
+        boundary_fit = float(np.clip(
+            boundary_sum / (boundary_area * 255.0 * 0.70), 0.0, 1.0
+        ))
 
         foreground_sum = np.array([
             self._rectangle_sum(channel, x, y, x + width, y + height)
-            for channel in statistics["lab"]
-        ])
-        context_sum = np.array([
-            self._rectangle_sum(channel, cx1, cy1, cx2, cy2)
             for channel in statistics["lab"]
         ])
         foreground_mean = foreground_sum / patch_area
@@ -553,11 +541,77 @@ class Attention:
         # internal variation, but a box mixing several unrelated background areas
         # should receive less objectness.
         coherence = float(np.exp(-np.mean(foreground_std) / 55.0))
-        surround_mean = (context_sum - foreground_sum) / ring_area
-        surround_contrast = float(np.clip(
-            np.linalg.norm(foreground_mean - surround_mean) / 85.0,
-            0.0, 1.0,
-        ))
+        contrast_band = max(3, min(12, int(round(min(width, height) * 0.10))))
+
+        def lab_mean(x1, y1, x2, y2):
+            area = (x2 - x1) * (y2 - y1)
+            if area <= 0:
+                return None
+            return np.array([
+                self._rectangle_sum(channel, x1, y1, x2, y2)
+                for channel in statistics["lab"]
+            ]) / area
+
+        def side_contrast(inner_coordinates, outer_coordinates):
+            inner_mean = lab_mean(*inner_coordinates)
+            outer_mean = lab_mean(*outer_coordinates)
+            if inner_mean is None or outer_mean is None:
+                return None
+            return float(np.clip(
+                np.linalg.norm(inner_mean - outer_mean) / 85.0, 0.0, 1.0
+            ))
+
+        contrast_top = None
+        if y > 0:
+            contrast_top = side_contrast(
+                (x, y, x + width, min(y + contrast_band, y + height)),
+                (x, max(0, y - contrast_band), x + width, y),
+            )
+        contrast_bottom = None
+        if y + height < image.shape[0]:
+            contrast_bottom = side_contrast(
+                (x, max(y, y + height - contrast_band), x + width, y + height),
+                (x, y + height, x + width,
+                 min(image.shape[0], y + height + contrast_band)),
+            )
+
+        # Top and bottom own the corner pixels. Vertical sides exclude those
+        # short corner sections so the same boundary is not counted twice.
+        corner_cut = min(contrast_band, max(0, height // 3))
+        vertical_y1 = y + corner_cut
+        vertical_y2 = y + height - corner_cut
+        vertical_length = max(0, vertical_y2 - vertical_y1)
+        contrast_left = None
+        if x > 0 and vertical_length > 0:
+            contrast_left = side_contrast(
+                (x, vertical_y1, min(x + contrast_band, x + width), vertical_y2),
+                (max(0, x - contrast_band), vertical_y1, x, vertical_y2),
+            )
+        contrast_right = None
+        if x + width < image.shape[1] and vertical_length > 0:
+            contrast_right = side_contrast(
+                (max(x, x + width - contrast_band), vertical_y1,
+                 x + width, vertical_y2),
+                (x + width, vertical_y1,
+                 min(image.shape[1], x + width + contrast_band), vertical_y2),
+            )
+
+        weighted_contrasts = [
+            (contrast_top, width),
+            (contrast_bottom, width),
+            (contrast_left, vertical_length),
+            (contrast_right, vertical_length),
+        ]
+        valid_contrasts = [
+            (value, length) for value, length in weighted_contrasts
+            if value is not None and length > 0
+        ]
+        if not valid_contrasts:
+            return None
+        surround_contrast = float(
+            sum(value * length for value, length in valid_contrasts)
+            / sum(length for _value, length in valid_contrasts)
+        )
         center = self.center_preference(window, image.shape)
         # A bright achromatic patch can otherwise win solely through its Lab
         # lightness contrast. Suppress that specific white-background bias while
@@ -571,22 +625,14 @@ class Attention:
             + 0.30 * surround_contrast
             + 0.16 * coherence
             + 0.12 * edge_score
-            + 0.08 * vividness,
+            + 0.08 * vividness
+            - 0.12 * white_bias,
             0.0, 1.0,
         ))
-        score = float(np.clip(
-            0.30 * boundary_fit
-            + 0.30 * surround_contrast
-            + 0.20 * vividness
-            + 0.15 * edge_score
-            + 0.05 * center,
-            0.0, 1.0,
+        ranking_score = float(np.clip(
+            0.95 * objectness + 0.05 * center, 0.0, 1.0
         ))
-        score = float(np.clip(
-            score - 0.12 * white_bias,
-            0.0, 1.0,
-        ))
-        if score < 0.18:
+        if objectness < 0.18:
             return None
         appearance = 0.60 * vividness + 0.40 * brightness_appeal
         return {
@@ -594,17 +640,22 @@ class Attention:
             "level": 0,
             "brightness": float(np.clip(brightness, 0.0, 1.0)),
             "contrast": surround_contrast,
+            "contrast_top": contrast_top,
+            "contrast_bottom": contrast_bottom,
+            "contrast_left": contrast_left,
+            "contrast_right": contrast_right,
             "color": float(np.clip(vividness, 0.0, 1.0)),
             "edge": edge_score,
             "boundary": boundary_fit,
             "white_bias": float(white_bias),
-            "visual": score,
+            "visual": ranking_score,
             "center": center,
             "objectness": objectness,
             "coherence": coherence,
             "appearance": float(np.clip(appearance, 0.0, 1.0)),
             "source": "default",
-            "score": score,
+            "ranking_score": ranking_score,
+            "score": ranking_score,
         }
 
     def color_regions(self, image):

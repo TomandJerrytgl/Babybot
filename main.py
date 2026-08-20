@@ -30,10 +30,14 @@ from perception import Perception
 
 LOGGER = logging.getLogger("babybot")
 SCORE_FIELDS = (
-    ("score", "attention score"),
+    ("ranking_score", "ranking score"),
     ("objectness", "objectness"),
     ("boundary", "boundary fit"),
     ("contrast", "Lab surround contrast"),
+    ("contrast_top", "Lab contrast — top"),
+    ("contrast_bottom", "Lab contrast — bottom"),
+    ("contrast_left", "Lab contrast — left"),
+    ("contrast_right", "Lab contrast — right"),
     ("color", "vividness"),
     ("edge", "internal edges"),
     ("coherence", "internal coherence"),
@@ -56,7 +60,6 @@ def calculate_attention_pair(perception: Perception, settings: dict):
     arguments = {
         "verbose": False,
         "objectness_threshold": settings["minimum_objectness"],
-        "minimum_attention_score": settings["minimum_attention_score"],
         "maximum_candidates": settings["maximum_candidates"],
         "partial_overlap_iou": settings["partial_overlap_iou"],
     }
@@ -90,7 +93,6 @@ class RuntimeConfig:
     perception_width: int = 320
     perception_height: int = 200
     observation_preview_fps: float = 20.0
-    minimum_attention_score: float = 0.25
     minimum_objectness: float = 0.45
     maximum_candidates_per_eye: int = 10
     partial_overlap_iou: float = 0.30
@@ -99,7 +101,6 @@ class RuntimeConfig:
 
     def attention_settings(self):
         return {
-            "minimum_attention_score": self.minimum_attention_score,
             "minimum_objectness": self.minimum_objectness,
             "maximum_candidates": self.maximum_candidates_per_eye,
             "partial_overlap_iou": self.partial_overlap_iou,
@@ -209,7 +210,7 @@ def encode_preview(image, candidates, quality):
         cv2.rectangle(annotated, (x, y), (x + width, y + height), color, 3 if rank == 1 else 2)
         cv2.putText(
             annotated,
-            f"#{candidate.get('rank', rank)} A:{candidate.get('score', 0.0):.2f} O:{candidate.get('objectness', 0.0):.2f}",
+            f"#{candidate.get('rank', rank)} R:{candidate.get('ranking_score', candidate.get('score', 0.0)):.2f} O:{candidate.get('objectness', 0.0):.2f}",
             (x, max(18, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
             color, 1, cv2.LINE_AA,
         )
@@ -242,7 +243,8 @@ def candidate_details(candidate):
         "area_fraction": round(float(candidate.get("area_fraction", 0.0)), 5),
     }
     for key, _label in SCORE_FIELDS:
-        details[key] = round(float(candidate.get(key, 0.0)), 4)
+        value = candidate.get(key)
+        details[key] = None if value is None else round(float(value), 4)
     return details
 
 
@@ -261,7 +263,8 @@ def write_attention_report(path, perception, result, identifier, jpeg_quality, c
             crop, _ = make_candidate_crop(getattr(perception, eye), candidate, crop_scale)
             details = candidate_details(candidate)
             score_lines = "".join(
-                f"<tr><th>{html.escape(label)}</th><td>{details[key]:.4f}</td></tr>"
+                f"<tr><th>{html.escape(label)}</th><td>"
+                f"{'—' if details[key] is None else f'{details[key]:.4f}'}</td></tr>"
                 for key, label in SCORE_FIELDS
             )
             window = details["window"]

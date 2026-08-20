@@ -228,11 +228,17 @@ not read, modified or deleted.
 - Each event-driven perception uses the newest observation and produces a 320x200
   stereo pair.
 - Each eye independently returns zero to ten attention candidates. A candidate must
-  have attention score >= 0.25 and objectness >= 0.45.
+  have objectness >= 0.45; ranking score is not an admission threshold.
 - Containment alternatives are retained. Non-containing candidates with IoU >= 0.30
   form overlap groups, and only the best two scores in each group are retained.
 - Every candidate exposes attention, objectness, boundary, Lab surround contrast,
   vividness, internal edges, coherence, center preference, window and area fraction.
+- Objectness alone drives boundary refinement. Display order uses 95% objectness and
+  5% center preference; center cannot change the candidate boundary.
+- Boundary density is normalized against 0.70 instead of 0.18. Lab contrast is measured
+  independently at top, bottom, left and right, then combined in proportion to each
+  valid side length. A side touching the image boundary is excluded and the remaining
+  weights are renormalized.
 - Candidate inspection crops are approximately 10% larger than the attention window
   and draw the actual attention boundary inside the crop.
 - `debug/attention_report.html` is atomically replaced after each completed perception.

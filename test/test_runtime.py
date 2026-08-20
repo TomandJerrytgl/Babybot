@@ -111,8 +111,12 @@ class AttentionTests(unittest.TestCase):
         item = Observation(1, time.time(), time.monotonic(), image, image.copy())
         result = Attention(item, verbose=False)
         self.assertLessEqual(len(result.candidates), 10)
-        self.assertTrue(all(candidate["score"] >= .25 for candidate in result.candidates))
         self.assertTrue(all(candidate["objectness"] >= .45 for candidate in result.candidates))
+        for candidate in result.candidates:
+            self.assertAlmostEqual(
+                candidate["ranking_score"],
+                .95 * candidate["objectness"] + .05 * candidate["center"],
+            )
 
 
 class TemplateTrackerTests(unittest.TestCase):
@@ -163,13 +167,18 @@ class VisualFrontEndTests(unittest.TestCase):
     def test_candidate_details_exposes_all_scores(self):
         candidate = {
             "window": (1, 2, 30, 40), "rank": 1, "area_fraction": .1,
-            "score": .8, "objectness": .7, "boundary": .6,
-            "contrast": .5, "color": .4, "edge": .3,
+            "score": .67, "ranking_score": .67,
+            "objectness": .7, "boundary": .6,
+            "contrast": .5, "contrast_top": .4, "contrast_bottom": .5,
+            "contrast_left": .6, "contrast_right": .7,
+            "color": .4, "edge": .3,
             "coherence": .2, "center": .1,
         }
         details = candidate_details(candidate)
-        for field in ("score", "objectness", "boundary", "contrast", "color",
-                      "edge", "coherence", "center", "area_fraction"):
+        for field in ("ranking_score", "objectness", "boundary", "contrast",
+                      "contrast_top", "contrast_bottom", "contrast_left",
+                      "contrast_right", "color", "edge", "coherence", "center",
+                      "area_fraction"):
             self.assertIn(field, details)
 
     def test_self_contained_report_embeds_images(self):
@@ -179,8 +188,11 @@ class VisualFrontEndTests(unittest.TestCase):
         )
         candidate = {
             "window": (20, 30, 60, 40), "rank": 1, "area_fraction": .0375,
-            "score": .8, "objectness": .7, "boundary": .6,
-            "contrast": .5, "color": .4, "edge": .3,
+            "score": .67, "ranking_score": .67,
+            "objectness": .7, "boundary": .6,
+            "contrast": .5, "contrast_top": .4, "contrast_bottom": .5,
+            "contrast_left": .6, "contrast_right": .7,
+            "color": .4, "edge": .3,
             "coherence": .2, "center": .1,
         }
         result = {"left": [candidate], "right": [], "left_elapsed": .1,
@@ -192,6 +204,7 @@ class VisualFrontEndTests(unittest.TestCase):
                 report = report_file.read()
         self.assertIn("data:image/jpeg;base64,", report)
         self.assertIn("objectness", report)
+        self.assertIn("Lab contrast — top", report)
 
 
 class AttentionValidatorTests(unittest.TestCase):
@@ -251,6 +264,37 @@ class CandidateGenerationTests(unittest.TestCase):
         candidate = attention.evaluate_fixed_window(image, (128, 68, 64, 64))
         self.assertIsNotNone(candidate)
         self.assertEqual(candidate["window"], (128, 68, 64, 64))
+
+    def test_surround_contrast_is_weighted_from_four_sides(self):
+        attention = Attention.__new__(Attention)
+        image = np.full((120, 180, 3), (100, 100, 100), dtype=np.uint8)
+        window = (60, 35, 60, 50)
+        image[35:85, 60:120] = (30, 90, 210)
+        image[29:35, 60:120] = (20, 20, 20)
+        image[85:91, 60:120] = (230, 230, 230)
+        image[41:79, 54:60] = (20, 180, 20)
+        image[41:79, 120:126] = (180, 20, 20)
+        candidate = attention.evaluate_fixed_window(image, window)
+        self.assertIsNotNone(candidate)
+        sides = (
+            (candidate["contrast_top"], 60),
+            (candidate["contrast_bottom"], 60),
+            (candidate["contrast_left"], 40),
+            (candidate["contrast_right"], 40),
+        )
+        expected = sum(value * length for value, length in sides) / sum(
+            length for _value, length in sides
+        )
+        self.assertAlmostEqual(candidate["contrast"], expected)
+
+    def test_image_edge_excludes_missing_contrast_side(self):
+        attention = Attention.__new__(Attention)
+        image = np.full((120, 180, 3), 120, dtype=np.uint8)
+        image[35:85, 0:60] = (30, 90, 210)
+        candidate = attention.evaluate_fixed_window(image, (0, 35, 60, 50))
+        self.assertIsNotNone(candidate)
+        self.assertIsNone(candidate["contrast_left"])
+        self.assertIsNotNone(candidate["contrast_right"])
 
     def test_uniform_window_is_not_attention(self):
         attention = Attention.__new__(Attention)
