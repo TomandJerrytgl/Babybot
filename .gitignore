@@ -75,3 +75,7 @@ dist/
 # Runtime visual memory (keep only its documentation in Git)
 memory/*
 !memory/README.md
+
+# Latest generated attention inspection report
+debug/attention_report.html
+debug/attention_report.html.tmp

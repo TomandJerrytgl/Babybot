@@ -193,3 +193,47 @@ The visual runtime now uses the following confirmed architecture:
 
 Runtime memory data is stored under `memory/` and ignored by Git; only its README is
 tracked.
+
+### Stereo identity and spatial perception
+
+- A default-attention pair is accepted only when both eyes have high objectness,
+  similar appearance, similar width/height/area, and compatible vertical geometry.
+- If ordinary candidates do not form a valid pair, the stronger eye temporarily guides
+  a dense search in the other eye. Failure to pass the same strict checks creates no
+  conscious object.
+- Objectness combines boundary fit, foreground/background Lab contrast, internal
+  coherence, edges and vividness. Each rectangle side is refined independently.
+- Before calibration, spatial perception records normalized pixel size, area fraction,
+  disparity, vertical error and geometry confidence. Physical distance and dimensions
+  remain unknown.
+- Memory identity weights appearance at 60%, perceived size at 32%, relative image
+  position at only 3%, and stereo quality at 5%. Size is a soft logarithmic comparison
+  so distance changes do not become an absolute rejection.
+- The web page shows the active conscious object's fixed left/right templates plus its
+  ID, curiosity, match streak, similarity and memory ID.
+## 2026-08 Visual front-end stabilization stage
+
+The active runtime is intentionally limited to:
+
+```text
+Observation -> Perception -> Attention
+```
+
+Conscious, curiosity, stereo identity matching and memory learning remain in the
+repository but are not called by `main.py` during this stage. Existing memory data is
+not read, modified or deleted.
+
+- Observation keeps only the latest 1280x800 stereo pair and targets a 20 Hz raw web
+  preview without attention overlays.
+- Each event-driven perception uses the newest observation and produces a 320x200
+  stereo pair.
+- Each eye independently returns zero to ten attention candidates. A candidate must
+  have attention score >= 0.25 and objectness >= 0.45.
+- Containment alternatives are retained. Non-containing candidates with IoU >= 0.30
+  form overlap groups, and only the best two scores in each group are retained.
+- Every candidate exposes attention, objectness, boundary, Lab surround contrast,
+  vividness, internal edges, coherence, center preference, window and area fraction.
+- Candidate inspection crops are approximately 10% larger than the attention window
+  and draw the actual attention boundary inside the crop.
+- `debug/attention_report.html` is atomically replaced after each completed perception.
+  It is self-contained, embeds all images, and never creates an automatic history.

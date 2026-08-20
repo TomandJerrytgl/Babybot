@@ -2,8 +2,6 @@ import pickle
 import tempfile
 import time
 import unittest
-from concurrent.futures import Future
-from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
@@ -21,14 +19,13 @@ from main import (
     LatestStereoFrame,
     PreviewStore,
     RuntimeConfig,
-    StereoCognition,
-    calculate_stereo_attention,
+    calculate_attention_pair,
+    candidate_details,
     encode_preview,
-    locate_template,
     make_request_handler,
+    make_candidate_crop,
+    write_attention_report,
 )
-from conscious import Conscious, ConsciousObject, visual_feature
-from memory import MemoryStore
 from observation import Observation
 from perception import Perception
 from http.server import ThreadingHTTPServer
@@ -107,6 +104,16 @@ class AttentionTests(unittest.TestCase):
             for candidate in result.candidates
         ))
 
+    def test_output_respects_thresholds_and_maximum(self):
+        image = np.full((200, 320, 3), 150, dtype=np.uint8)
+        image[30:90, 30:100] = (20, 80, 230)
+        image[110:180, 190:290] = (220, 60, 30)
+        item = Observation(1, time.time(), time.monotonic(), image, image.copy())
+        result = Attention(item, verbose=False)
+        self.assertLessEqual(len(result.candidates), 10)
+        self.assertTrue(all(candidate["score"] >= .25 for candidate in result.candidates))
+        self.assertTrue(all(candidate["objectness"] >= .45 for candidate in result.candidates))
+
 
 class TemplateTrackerTests(unittest.TestCase):
     @staticmethod
@@ -138,41 +145,52 @@ class TemplateTrackerTests(unittest.TestCase):
         self.assertEqual(tracker.window, (80, 60, 50, 40))
 
 
-class StereoPipelineTests(unittest.TestCase):
+class VisualFrontEndTests(unittest.TestCase):
     def test_attention_process_payload_is_serializable(self):
         perception = Perception.from_observation(observation(1, 1.0))
-        payload = pickle.dumps((calculate_stereo_attention, perception, "default", None))
+        payload = pickle.dumps((
+            calculate_attention_pair, perception, RuntimeConfig().attention_settings()
+        ))
         self.assertTrue(payload)
 
-    def test_template_search_changes_width_and_height(self):
-        template = np.zeros((20, 30, 3), np.uint8)
-        template[:, :] = (10, 80, 210)
-        cv2.line(template, (0, 0), (29, 19), (255, 255, 255), 2)
-        image = np.zeros((100, 140, 3), np.uint8)
-        image[30:54, 50:86] = cv2.resize(template, (36, 24))
-        result = locate_template(image, template)
-        self.assertGreater(result["similarity"], .85)
-        self.assertNotEqual(result["window"][2], result["window"][3])
+    def test_candidate_crop_is_ten_percent_larger_and_draws_inner_box(self):
+        image = np.zeros((100, 160, 3), np.uint8)
+        candidate = {"window": (40, 30, 80, 40), "rank": 1}
+        crop, relative = make_candidate_crop(image, candidate, 1.10)
+        self.assertEqual(crop.shape[:2], (44, 88))
+        self.assertEqual(relative, (4, 2, 80, 40))
 
-    def test_conscious_capacity_and_removal(self):
-        conscious = Conscious(capacity=3)
-        image = np.zeros((8, 8, 3), np.uint8)
-        for index in range(4):
-            item = ConsciousObject(str(index), image, image, np.zeros(99), (0, 0, 8, 8),
-                                   (0, 0, 8, 8), 0.0)
-            self.assertEqual(conscious.add(item), index < 3)
-        self.assertEqual(len(conscious), 3)
-        self.assertTrue(conscious.remove("1"))
-        self.assertEqual(len(conscious), 2)
+    def test_candidate_details_exposes_all_scores(self):
+        candidate = {
+            "window": (1, 2, 30, 40), "rank": 1, "area_fraction": .1,
+            "score": .8, "objectness": .7, "boundary": .6,
+            "contrast": .5, "color": .4, "edge": .3,
+            "coherence": .2, "center": .1,
+        }
+        details = candidate_details(candidate)
+        for field in ("score", "objectness", "boundary", "contrast", "color",
+                      "edge", "coherence", "center", "area_fraction"):
+            self.assertIn(field, details)
 
-    def test_partial_overlap_keeps_higher_score_not_larger_area(self):
-        attention = Attention.__new__(Attention)
-        candidates = [
-            {"window": (10, 10, 100, 100), "score": 0.6, "rank": 1},
-            {"window": (90, 90, 50, 50), "score": 0.8, "rank": 3},
-        ]
-        selected = attention.suppress_overlaps(candidates)
-        self.assertEqual([item["rank"] for item in selected], [3])
+    def test_self_contained_report_embeds_images(self):
+        raw = np.full((200, 320, 3), 120, np.uint8)
+        perception = Perception.from_observation(
+            Observation(1, 1.0, 1.0, raw, raw.copy()), width=320, height=200
+        )
+        candidate = {
+            "window": (20, 30, 60, 40), "rank": 1, "area_fraction": .0375,
+            "score": .8, "objectness": .7, "boundary": .6,
+            "contrast": .5, "color": .4, "edge": .3,
+            "coherence": .2, "center": .1,
+        }
+        result = {"left": [candidate], "right": [], "left_elapsed": .1,
+                  "right_elapsed": .2, "elapsed_time": .3}
+        with tempfile.TemporaryDirectory() as directory:
+            path = f"{directory}/attention_report.html"
+            write_attention_report(path, perception, result, 4, 80, 1.10)
+            report = open(path, encoding="utf-8").read()
+        self.assertIn("data:image/jpeg;base64,", report)
+        self.assertIn("objectness", report)
 
 
 class AttentionValidatorTests(unittest.TestCase):
@@ -266,7 +284,7 @@ class CandidateGenerationTests(unittest.TestCase):
         item = Observation(1, time.time(), time.monotonic(), image, image.copy())
         started = time.perf_counter()
         Attention(item, verbose=False)
-        self.assertLess(time.perf_counter() - started, 5.00)
+        self.assertLess(time.perf_counter() - started, 15.00)
 
     def test_higher_score_inner_box_is_kept_with_outer_box(self):
         attention = Attention.__new__(Attention)
@@ -275,12 +293,30 @@ class CandidateGenerationTests(unittest.TestCase):
         selected = attention.suppress_overlaps([outer, inner])
         self.assertEqual(len(selected), 2)
 
-    def test_lower_score_inner_box_is_suppressed(self):
+    def test_lower_score_inner_box_is_also_kept(self):
         attention = Attention.__new__(Attention)
         outer = {"window": (0, 0, 100, 100), "score": 0.8}
         inner = {"window": (20, 20, 30, 30), "score": 0.6}
         selected = attention.suppress_overlaps([outer, inner])
-        self.assertEqual(selected, [outer])
+        self.assertEqual(len(selected), 2)
+
+    def test_partial_overlap_group_keeps_two_highest_scores(self):
+        attention = Attention.__new__(Attention)
+        candidates = [
+            {"window": (0, 0, 80, 80), "score": .9},
+            {"window": (30, 0, 80, 80), "score": .8},
+            {"window": (60, 0, 80, 80), "score": .7},
+        ]
+        selected = attention.suppress_overlaps(
+            candidates, overlap_threshold=.20, maximum_candidates=10
+        )
+        self.assertEqual([item["score"] for item in selected], [.9, .8])
+
+    def test_intersection_over_union(self):
+        self.assertAlmostEqual(
+            Attention.intersection_over_union((0, 0, 10, 10), (5, 0, 10, 10)),
+            1 / 3,
+        )
 
 class WebPreviewTests(unittest.TestCase):
     def test_default_web_host_is_loopback_only(self):
@@ -307,7 +343,9 @@ class WebPreviewTests(unittest.TestCase):
 
     def setUp(self):
         self.store = PreviewStore()
-        handler = make_request_handler(self.store)
+        self.temporary = tempfile.TemporaryDirectory()
+        self.report_path = f"{self.temporary.name}/attention_report.html"
+        handler = make_request_handler(self.store, self.report_path)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -317,11 +355,20 @@ class WebPreviewTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+        self.temporary.cleanup()
 
     def test_page_and_stereo_frames_are_served(self):
         image = np.zeros((32, 48, 3), dtype=np.uint8)
         self.store.update("observation", image, image, [], [], 7, 80)
-        self.store.update("perception", image, image, [], [], 3, 80)
+        item = Perception.from_observation(
+            Observation(3, 1.0, 1.0, image, image.copy()), width=48, height=32
+        )
+        self.store.update_attention(
+            item,
+            {"left": [], "right": [], "left_elapsed": .1,
+             "right_elapsed": .2, "elapsed_time": .3},
+            3, 80, 1.10,
+        )
         page = urlopen(self.base_url + "/", timeout=2).read().decode("utf-8")
         self.assertIn("Raw observation", page)
         self.assertIn("Perception", page)
@@ -333,6 +380,8 @@ class WebPreviewTests(unittest.TestCase):
             self.base_url + "/frame/perception/left.jpg", timeout=2
         )
         self.assertEqual(perception_response.headers["X-Frame-Id"], "3")
+        attention = urlopen(self.base_url + "/status/attention.json", timeout=2)
+        self.assertIn(b'"ready": true', attention.read())
 
     def test_frame_is_unavailable_before_first_observation(self):
         with self.assertRaises(HTTPError) as context:

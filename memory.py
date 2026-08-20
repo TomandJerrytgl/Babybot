@@ -47,11 +47,48 @@ class MemoryStore:
             json.dump(self.manifest, handle, ensure_ascii=False, indent=2)
         temporary.replace(self.manifest_path)
 
-    def find_similar(self, feature) -> tuple[Optional[dict], float]:
+    @staticmethod
+    def _ratio_similarity(first, second):
+        if first is None or second is None or first <= 0 or second <= 0:
+            return 0.5
+        return float(np.exp(-abs(np.log(float(first) / float(second)))))
+
+    @classmethod
+    def perceptual_similarity(cls, feature, spatial, sample):
+        """Identity score: appearance and size dominate; position is negligible."""
+        visual = feature_similarity(feature, sample["feature"])
+        if not spatial:
+            return visual
+        previous = sample.get("metadata", {})
+        # Memories written before spatial descriptors were introduced remain
+        # usable and are upgraded naturally when a new sample is learned.
+        if "width_fraction" not in previous:
+            return visual
+        size = np.mean([
+            cls._ratio_similarity(spatial.get("width_fraction"), previous.get("width_fraction")),
+            cls._ratio_similarity(spatial.get("height_fraction"), previous.get("height_fraction")),
+            cls._ratio_similarity(spatial.get("area_fraction"), previous.get("area_fraction")),
+        ])
+        position = np.mean([
+            cls._ratio_similarity(1.0 + spatial.get("relative_x", 0.0),
+                                  1.0 + previous.get("relative_x", 0.0)),
+            cls._ratio_similarity(1.0 + spatial.get("relative_y", 0.0),
+                                  1.0 + previous.get("relative_y", 0.0)),
+        ])
+        geometry = float(np.clip(
+            min(spatial.get("geometry_confidence", 0.5),
+                previous.get("geometry_confidence", 0.5)), 0.0, 1.0
+        ))
+        return float(np.clip(
+            0.60 * visual + 0.32 * size + 0.03 * position + 0.05 * geometry,
+            0.0, 1.0,
+        ))
+
+    def find_similar(self, feature, spatial=None) -> tuple[Optional[dict], float]:
         best, best_score = None, 0.0
         for item in self.manifest["objects"]:
             for sample in item.get("samples", []):
-                score = feature_similarity(feature, sample["feature"])
+                score = self.perceptual_similarity(feature, spatial, sample)
                 if score > best_score:
                     best, best_score = item, score
         if best_score < self.similarity_threshold:
@@ -60,7 +97,7 @@ class MemoryStore:
 
     def learn(self, left, right, feature, metadata):
         """Create/update memory and return (memory_id, created, similarity)."""
-        similar, similarity = self.find_similar(feature)
+        similar, similarity = self.find_similar(feature, metadata)
         if similar is None:
             if self.object_count >= self.maximum_objects:
                 self.manifest["learning_stopped"] = True

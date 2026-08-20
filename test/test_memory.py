@@ -45,6 +45,21 @@ class MemoryStoreTests(unittest.TestCase):
             self.assertEqual(store.object_count, 2)
             self.assertTrue(store.learning_stopped)
 
+    def test_size_has_high_weight_but_position_has_low_weight(self):
+        image, feature = self.sample((20, 90, 210))
+        base = self.metadata(1)
+        base.update({"width_fraction": .20, "height_fraction": .25,
+                     "area_fraction": .05, "relative_x": .2, "relative_y": .2,
+                     "geometry_confidence": .9})
+        sample = {"feature": feature.tolist(), "metadata": base}
+        moved = dict(base, relative_x=.8, relative_y=.8)
+        different_size = dict(base, width_fraction=.55, height_fraction=.60,
+                              area_fraction=.33)
+        moved_score = MemoryStore.perceptual_similarity(feature, moved, sample)
+        size_score = MemoryStore.perceptual_similarity(feature, different_size, sample)
+        self.assertGreater(moved_score, .95)
+        self.assertGreater(moved_score, size_score)
+
 
 if __name__ == "__main__":
     unittest.main()

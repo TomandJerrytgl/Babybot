@@ -1,4 +1,4 @@
-"""Low-latency motion-first visual attention for Babybot."""
+"""Explainable single-frame visual attention for Babybot."""
 
 from __future__ import annotations
 
@@ -327,7 +327,10 @@ class Attention:
         verbose=True,
         analysis_width=320,
         hold_observations=10,
-        objectness_threshold=0.18,
+        objectness_threshold=0.45,
+        minimum_attention_score=0.25,
+        maximum_candidates=10,
+        partial_overlap_iou=0.30,
     ):
         del object, previous_focus, previous_focus_age, hold_observations
         if eye not in ("left", "right"):
@@ -337,6 +340,9 @@ class Attention:
         self.verbose = verbose
         self.analysis_width = int(analysis_width)
         self.objectness_threshold = float(objectness_threshold)
+        self.minimum_attention_score = float(minimum_attention_score)
+        self.maximum_candidates = int(maximum_candidates)
+        self.partial_overlap_iou = float(partial_overlap_iou)
         self.candidates = []
         self.elapsed_time = 0.0
         self.focus_source = "none"
@@ -383,14 +389,24 @@ class Attention:
 
         candidates = []
         for candidate in candidates_by_window.values():
+            if (candidate["score"] < self.minimum_attention_score
+                    or candidate["objectness"] < self.objectness_threshold):
+                continue
             window = candidate["window"]
             mapped = self.map_window(window, scale_x, scale_y, image.shape)
             candidate["window"] = mapped
+            candidate["area_fraction"] = float(
+                mapped[2] * mapped[3] / (image.shape[0] * image.shape[1])
+            )
             candidates.append(candidate)
 
         self.candidates = self.suppress_overlaps(
-            candidates, overlap_threshold=0.65, maximum_candidates=5
+            candidates,
+            overlap_threshold=self.partial_overlap_iou,
+            maximum_candidates=self.maximum_candidates,
         )
+        for rank, candidate in enumerate(self.candidates, start=1):
+            candidate["rank"] = rank
         self.elapsed_time = time.perf_counter() - start
         if self.candidates:
             self.focus_source = self.candidates[0]["source"]
@@ -462,6 +478,13 @@ class Attention:
                 cv2.integral(lab[:, :, channel], sdepth=cv2.CV_64F)
                 for channel in range(3)
             ),
+            "lab_squared": tuple(
+                cv2.integral(
+                    lab[:, :, channel].astype(np.float32) ** 2,
+                    sdepth=cv2.CV_64F,
+                )
+                for channel in range(3)
+            ),
         }
 
     @staticmethod
@@ -519,18 +542,48 @@ class Attention:
             for channel in statistics["lab"]
         ])
         foreground_mean = foreground_sum / patch_area
+        foreground_squared_mean = np.array([
+            self._rectangle_sum(channel, x, y, x + width, y + height)
+            for channel in statistics["lab_squared"]
+        ]) / patch_area
+        foreground_std = np.sqrt(np.maximum(
+            0.0, foreground_squared_mean - foreground_mean ** 2
+        ))
+        # Coherence is deliberately soft: patterned objects may have substantial
+        # internal variation, but a box mixing several unrelated background areas
+        # should receive less objectness.
+        coherence = float(np.exp(-np.mean(foreground_std) / 55.0))
         surround_mean = (context_sum - foreground_sum) / ring_area
         surround_contrast = float(np.clip(
             np.linalg.norm(foreground_mean - surround_mean) / 85.0,
             0.0, 1.0,
         ))
         center = self.center_preference(window, image.shape)
+        # A bright achromatic patch can otherwise win solely through its Lab
+        # lightness contrast. Suppress that specific white-background bias while
+        # leaving dark achromatic objects and vivid bright objects unaffected.
+        white_bias = (
+            (1.0 - vividness)
+            * float(np.clip((brightness - 0.80) / 0.20, 0.0, 1.0))
+        )
+        objectness = float(np.clip(
+            0.34 * boundary_fit
+            + 0.30 * surround_contrast
+            + 0.16 * coherence
+            + 0.12 * edge_score
+            + 0.08 * vividness,
+            0.0, 1.0,
+        ))
         score = float(np.clip(
             0.30 * boundary_fit
             + 0.30 * surround_contrast
             + 0.20 * vividness
             + 0.15 * edge_score
             + 0.05 * center,
+            0.0, 1.0,
+        ))
+        score = float(np.clip(
+            score - 0.12 * white_bias,
             0.0, 1.0,
         ))
         if score < 0.18:
@@ -544,9 +597,11 @@ class Attention:
             "color": float(np.clip(vividness, 0.0, 1.0)),
             "edge": edge_score,
             "boundary": boundary_fit,
+            "white_bias": float(white_bias),
             "visual": score,
             "center": center,
-            "objectness": surround_contrast,
+            "objectness": objectness,
+            "coherence": coherence,
             "appearance": float(np.clip(appearance, 0.0, 1.0)),
             "source": "default",
             "score": score,
@@ -1192,9 +1247,10 @@ class Attention:
             "score": float(np.clip(score, 0.0, 1.0)),
         }
 
-    def suppress_overlaps(self, candidates, overlap_threshold=0.65, maximum_candidates=5):
-        del overlap_threshold
-        selected = []
+    def suppress_overlaps(
+            self, candidates, overlap_threshold=0.30,
+            maximum_candidates=10, maximum_partial_group=2):
+        """Keep all containment alternatives and the best two per partial-overlap group."""
         ordered = sorted(
             candidates,
             key=lambda item: (
@@ -1202,12 +1258,45 @@ class Attention:
             ),
             reverse=True,
         )
-        for candidate in ordered:
-            if all(self.candidates_compatible(candidate, chosen) for chosen in selected):
-                selected.append(candidate)
-                if len(selected) >= maximum_candidates:
-                    break
-        return selected
+        adjacency = [set() for _ in ordered]
+        for first_index, first in enumerate(ordered):
+            for second_index in range(first_index + 1, len(ordered)):
+                second = ordered[second_index]
+                first_window, second_window = first["window"], second["window"]
+                if (self.contains(first_window, second_window)
+                        or self.contains(second_window, first_window)):
+                    continue
+                if self.intersection_over_union(first_window, second_window) >= overlap_threshold:
+                    adjacency[first_index].add(second_index)
+                    adjacency[second_index].add(first_index)
+
+        kept_indices = set()
+        unseen = set(range(len(ordered)))
+        while unseen:
+            root = unseen.pop()
+            component = {root}
+            pending = [root]
+            while pending:
+                current = pending.pop()
+                neighbors = adjacency[current] & unseen
+                unseen.difference_update(neighbors)
+                component.update(neighbors)
+                pending.extend(neighbors)
+            ranked_component = sorted(
+                component,
+                key=lambda index: ordered[index]["score"],
+                reverse=True,
+            )
+            kept_indices.update(ranked_component[:maximum_partial_group])
+
+        selected = [ordered[index] for index in kept_indices]
+        selected.sort(
+            key=lambda item: (
+                item["score"], item["window"][2] * item["window"][3]
+            ),
+            reverse=True,
+        )
+        return selected[:maximum_candidates]
 
     @classmethod
     def candidates_compatible(cls, first, second):
@@ -1234,6 +1323,15 @@ class Attention:
         return max(0, min(ax + aw, bx + bw) - max(ax, bx)) * max(
             0, min(ay + ah, by + bh) - max(ay, by)
         )
+
+    @classmethod
+    def intersection_over_union(cls, first, second):
+        intersection = cls.intersection_area(first, second)
+        if intersection <= 0:
+            return 0.0
+        first_area = first[2] * first[3]
+        second_area = second[2] * second[3]
+        return float(intersection / max(1, first_area + second_area - intersection))
 
     @classmethod
     def contains(cls, outer, inner, tolerance=2):
