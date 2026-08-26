@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor, TimeoutError
 from dataclasses import dataclass
 import html
@@ -253,12 +254,16 @@ class LatestStereoFrame:
         self._left = None
         self._right = None
         self._version = 0
+        self._capture_times = deque(maxlen=120)
 
-    def update(self, left, right):
+    def update(self, left, right, monotonic_time=None):
         with self._lock:
             self._left = left
             self._right = right
             self._version += 1
+            self._capture_times.append(
+                time.monotonic() if monotonic_time is None else float(monotonic_time)
+            )
 
     def snapshot(self, copy=True):
         with self._lock:
@@ -267,6 +272,15 @@ class LatestStereoFrame:
             left = self._left.copy() if copy else self._left
             right = self._right.copy() if copy else self._right
             return left, right, self._version
+
+    def capture_fps(self, fallback):
+        with self._lock:
+            if len(self._capture_times) < 2:
+                return float(fallback)
+            elapsed = self._capture_times[-1] - self._capture_times[0]
+            if elapsed <= 0:
+                return float(fallback)
+            return (len(self._capture_times) - 1) / elapsed
 
 
 def encode_jpeg(image, quality):
@@ -655,7 +669,8 @@ class BabybotRuntime:
         left, right, _version = snapshot
         if left.shape != right.shape:
             return False
-        return self.recorder.start(left.shape)
+        estimated_fps = self.latest_frames.capture_fps(self.config.camera_fps)
+        return self.recorder.start(left.shape, video_fps=estimated_fps)
 
     def request_recording_stop(self):
         return self.recorder.stop_async()
@@ -714,9 +729,11 @@ class BabybotRuntime:
             pair = self._capture_pair()
             if pair is not None:
                 left, right, sync_delta_ns = pair
-                self.latest_frames.update(left, right)
                 capture_wall_ns = time.time_ns()
                 capture_monotonic_ns = time.monotonic_ns()
+                self.latest_frames.update(
+                    left, right, monotonic_time=capture_monotonic_ns / 1e9
+                )
                 self.recorder.submit(
                     left, right, timestamp_ns=capture_wall_ns,
                     monotonic_ns=capture_monotonic_ns,

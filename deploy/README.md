@@ -11,9 +11,9 @@ package supplied with JetPack when available.
 
 The web page now controls paired stereo recording. Local datasets default to
 `recordings/`; that directory is intentionally ignored by the public Babybot
-repository. Each stopped recording keeps all paired JPEG frames, creates left
-and right videos, writes `pairs.csv` and `metadata.json`, and creates
-`frames.zip` for private synchronization.
+repository. Each recording directly writes synchronized left and right videos
+plus `pairs.csv` and `metadata.json`; it does not retain a duplicate JPEG frame
+tree or frame archive.
 
 GitHub visibility is repository-wide, so recordings cannot be private inside
 the public Babybot repository. Prepare a private `TGLgeneral` clone owned by the
@@ -35,8 +35,9 @@ to `ExecStart`:
 The account needs write access to `TGLgeneral`, and the repository needs enough
 Git LFS storage and bandwidth. Upload failures leave local data intact and can
 be retried from the web page. A clone of the private dataset is directly
-readable with `StereoDataset`; if only `frames.zip` is present, the reader
-restores `frames/` automatically.
+readable with `StereoDataset`, which synchronously decodes both videos for
+training. Older v1 batches containing JPEG frames or `frames.zip` remain
+readable.
 
 After copying the project and checking that `python3 main.py` works manually:
 

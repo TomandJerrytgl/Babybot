@@ -6,7 +6,7 @@ import csv
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 import zipfile
 
 import cv2
@@ -18,8 +18,8 @@ class StereoFramePair:
     timestamp_ns: int
     monotonic_ns: int
     sync_delta_ns: int
-    left_path: Path
-    right_path: Path
+    left_path: Optional[Path]
+    right_path: Optional[Path]
 
 
 class StereoDataset:
@@ -34,7 +34,11 @@ class StereoDataset:
                 f"Not a Babybot stereo dataset: {self.root}"
             )
         self.metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
-        self._ensure_frames_available()
+        self.schema = self.metadata.get("schema", "babybot.stereo-recording/v1")
+        if self.schema == "babybot.stereo-recording/v1":
+            self._ensure_frames_available()
+        elif self.schema != "babybot.stereo-recording/v2":
+            raise ValueError(f"Unsupported stereo dataset schema: {self.schema}")
 
     def _ensure_frames_available(self):
         """Restore archived frames after a dataset was cloned from TGLgeneral."""
@@ -60,18 +64,48 @@ class StereoDataset:
                     timestamp_ns=int(row["timestamp_ns"]),
                     monotonic_ns=int(row["monotonic_ns"]),
                     sync_delta_ns=int(row.get("sync_delta_ns", 0)),
-                    left_path=self.root / row["left_path"],
-                    right_path=self.root / row["right_path"],
+                    left_path=(self.root / row["left_path"] if row.get("left_path") else None),
+                    right_path=(self.root / row["right_path"] if row.get("right_path") else None),
                 )
 
     def images(self):
         """Yield ``(pair, left_bgr, right_bgr)`` for model training."""
+        if self.schema == "babybot.stereo-recording/v2":
+            yield from self._video_images()
+            return
         for pair in self.pairs():
             left = cv2.imread(str(pair.left_path), cv2.IMREAD_COLOR)
             right = cv2.imread(str(pair.right_path), cv2.IMREAD_COLOR)
             if left is None or right is None:
                 raise ValueError(f"Unreadable frame pair {pair.index} in {self.root}")
             yield pair, left, right
+
+    def _video_images(self):
+        captures = {
+            eye: cv2.VideoCapture(str(self._video_path(eye)))
+            for eye in ("left", "right")
+        }
+        try:
+            if not all(capture.isOpened() for capture in captures.values()):
+                raise ValueError(f"Unable to open paired videos in {self.root}")
+            for pair in self.pairs():
+                left_ok, left = captures["left"].read()
+                right_ok, right = captures["right"].read()
+                if not left_ok or not right_ok or left is None or right is None:
+                    raise ValueError(f"Video ended before pair {pair.index} in {self.root}")
+                yield pair, left, right
+        finally:
+            for capture in captures.values():
+                capture.release()
+
+    def _video_path(self, eye):
+        for video in self.metadata.get("videos", []):
+            if video.get("eye") == eye:
+                path = self.root / video["path"]
+                if not path.is_file():
+                    raise FileNotFoundError(path)
+                return path
+        raise ValueError(f"Metadata has no {eye} video")
 
     def validate(self):
         errors = []

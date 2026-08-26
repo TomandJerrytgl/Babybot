@@ -262,16 +262,20 @@ not read, modified or deleted.
 - The existing port-forwarded web page provides start/stop controls for stereo
   training recording; recording has no fixed duration or batch-count limit.
 - Each successful camera `grab`/`retrieve` cycle is treated as one paired sample.
-  Left and right full-resolution JPEG frames are stored separately with shared
-  indices and capture timestamps in `pairs.csv`.
-- Every batch also contains `metadata.json`, separately encoded left/right videos,
-  and a `frames.zip` transport archive. Local source frames remain available.
+  Its shared index, capture timestamp and measured software synchronization gap
+  are stored in `pairs.csv`.
+- Every v2 batch directly stores synchronized left/right videos plus
+  `metadata.json`. It does not retain duplicate JPEG trees or `frames.zip`, which
+  substantially reduces local and Git LFS storage.
 - `StereoDataset` is the stable model-independent training input. It iterates paired
-  BGR images, validates the manifest, and restores `frames/` from the archive when a
-  private repository clone only contains the transport form.
+  BGR images by synchronously decoding both videos. Existing v1 JPEG/archive batches
+  remain readable for backward compatibility.
 - Finalized data is synchronized to `babybot/stereo_test_data/` in a separately
   cloned private `TGLgeneral` repository through Git LFS. Git authentication remains
   external to the source code. A failed upload never removes the local recording.
 - Recording disk I/O runs outside the camera thread. If its bounded queue cannot
   keep up, a frame cannot be written, or the free-space reserve is reached, recording
   stops safely and reports the failure rather than silently dropping paired samples.
+- The video frame rate is estimated from recent live capture timing before recording.
+  Metadata separately records requested duration, timestamp-derived capture duration,
+  effective capture FPS, video FPS and post-processing duration.

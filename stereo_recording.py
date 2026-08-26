@@ -13,7 +13,6 @@ import shutil
 import subprocess
 import threading
 import time
-import zipfile
 
 import cv2
 
@@ -50,10 +49,8 @@ class GitLfsUploader:
             raise RuntimeError(f"Upload repository is not a Git clone: {self.repository}")
         source = Path(recording_directory)
         target = self.repository / self.subdirectory / source.name
-        if target.exists():
-            raise FileExistsError(f"Remote staging directory already exists: {target}")
-        target.mkdir(parents=True)
-        for name in ("videos", "pairs.csv", "metadata.json", "frames.zip"):
+        target.mkdir(parents=True, exist_ok=True)
+        for name in ("videos", "pairs.csv", "metadata.json"):
             item = source / name
             if item.exists():
                 shutil.copytree(item, target / name) if item.is_dir() else shutil.copy2(item, target / name)
@@ -61,12 +58,23 @@ class GitLfsUploader:
         self._git("lfs", "install", "--local")
         self._git("lfs", "track", "*.mp4", "*.avi", "*.zip")
         self._git("add", ".gitattributes", str(relative))
-        self._git(
-            "commit", "-m", f"Add Babybot stereo recording {source.name}",
-            "--", ".gitattributes", str(relative),
-        )
+        if self._git_changed(".gitattributes", str(relative)):
+            self._git(
+                "commit", "-m", f"Add Babybot stereo recording {source.name}",
+                "--", ".gitattributes", str(relative),
+            )
         self._git("push")
         return str(target)
+
+    def _git_changed(self, *paths):
+        process = subprocess.run(
+            ["git", "diff", "--cached", "--quiet", "--", *paths],
+            cwd=self.repository, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=60,
+        )
+        if process.returncode not in (0, 1):
+            raise RuntimeError("Unable to inspect staged upload changes")
+        return process.returncode == 1
 
     def _git(self, *arguments):
         process = subprocess.run(
@@ -98,10 +106,17 @@ class StereoRecorder:
         self._started_wall_ns = None
         self._started_monotonic = None
         self._frame_shape = None
+        self._video_fps = config.camera_fps
+        self._video_writers = {}
+        self._video_outputs = []
         self._count = 0
         self._submitted = 0
         self._sync_delta_total_ns = 0
         self._sync_delta_max_ns = 0
+        self._first_frame_monotonic_ns = None
+        self._last_frame_monotonic_ns = None
+        self._stopped_wall_ns = None
+        self._stopped_monotonic_ns = None
         self._status = {
             "state": "idle", "recording": False, "message": "Ready to record",
             "paired_frame_count": 0, "duration_seconds": 0.0,
@@ -119,7 +134,7 @@ class StereoRecorder:
             result["queued_pairs"] = 0 if self._queue is None else self._queue.qsize()
             return result
 
-    def start(self, frame_shape):
+    def start(self, frame_shape, video_fps=None):
         with self._lock:
             if self._status["state"] != "idle":
                 return False
@@ -128,13 +143,10 @@ class StereoRecorder:
             base.mkdir(parents=True, exist_ok=True)
             name = now.strftime("recording_%Y%m%dT%H%M%S_%fZ")
             batch = base / name
-            (batch / "frames" / "left").mkdir(parents=True)
-            (batch / "frames" / "right").mkdir(parents=True)
-            (batch / "videos").mkdir()
+            (batch / "videos").mkdir(parents=True)
             stream = (batch / "pairs.csv").open("w", encoding="utf-8", newline="")
             writer = csv.DictWriter(stream, fieldnames=(
-                "index", "timestamp_ns", "monotonic_ns", "left_path", "right_path"
-                , "sync_delta_ns"
+                "index", "timestamp_ns", "monotonic_ns", "sync_delta_ns"
             ))
             writer.writeheader()
             self._batch = batch
@@ -143,15 +155,24 @@ class StereoRecorder:
             self._started_wall_ns = time.time_ns()
             self._started_monotonic = time.monotonic()
             self._frame_shape = tuple(int(value) for value in frame_shape)
+            requested_fps = self.config.camera_fps if video_fps is None else float(video_fps)
+            self._video_fps = max(1.0, requested_fps)
+            self._video_writers = {}
+            self._video_outputs = []
             self._count = 0
             self._submitted = 0
             self._sync_delta_total_ns = 0
             self._sync_delta_max_ns = 0
+            self._first_frame_monotonic_ns = None
+            self._last_frame_monotonic_ns = None
+            self._stopped_wall_ns = None
+            self._stopped_monotonic_ns = None
             self._queue = queue.Queue(maxsize=self.config.queue_capacity)
             self._status.update({
                 "state": "recording", "recording": True, "message": "Recording",
                 "paired_frame_count": 0, "duration_seconds": 0.0,
                 "batch": name, "error": None, "upload_path": None,
+                "video_fps": round(self._video_fps, 3),
             })
             self._writer = threading.Thread(
                 target=self._writer_loop, name="stereo-frame-writer", daemon=True
@@ -188,6 +209,8 @@ class StereoRecorder:
                 "state": "stopping", "recording": False,
                 "message": "Finishing queued frames",
             })
+            self._stopped_wall_ns = time.time_ns()
+            self._stopped_monotonic_ns = time.monotonic_ns()
             work_queue = self._queue
             self._finalizer = threading.Thread(
                 target=self._finish, args=(work_queue,), name="stereo-finalizer", daemon=True
@@ -233,18 +256,13 @@ class StereoRecorder:
                             f"Only {free} bytes remain; the recording reserve is "
                             f"{self.config.minimum_free_bytes} bytes"
                         )
-                name = f"{index:08d}.jpg"
-                left_rel = Path("frames/left") / name
-                right_rel = Path("frames/right") / name
-                options = [cv2.IMWRITE_JPEG_QUALITY, int(self.config.jpeg_quality)]
-                left_ok = cv2.imwrite(str(self._batch / left_rel), left, options)
-                right_ok = cv2.imwrite(str(self._batch / right_rel), right, options)
-                if not left_ok or not right_ok:
-                    raise OSError(f"Failed to write stereo frame pair {index}")
+                if not self._video_writers:
+                    self._open_video_writers()
+                self._video_writers["left"].write(left)
+                self._video_writers["right"].write(right)
                 self._csv_writer.writerow({
                     "index": index, "timestamp_ns": wall_ns, "monotonic_ns": monotonic_ns,
                     "sync_delta_ns": sync_delta_ns,
-                    "left_path": left_rel.as_posix(), "right_path": right_rel.as_posix(),
                 })
                 self._csv_stream.flush()
             except Exception as error:
@@ -255,6 +273,9 @@ class StereoRecorder:
                 self._count += 1
                 self._sync_delta_total_ns += sync_delta_ns
                 self._sync_delta_max_ns = max(self._sync_delta_max_ns, sync_delta_ns)
+                if self._first_frame_monotonic_ns is None:
+                    self._first_frame_monotonic_ns = monotonic_ns
+                self._last_frame_monotonic_ns = monotonic_ns
                 self._status["paired_frame_count"] = self._count
             self._queue.task_done()
 
@@ -270,12 +291,13 @@ class StereoRecorder:
         work_queue.put(None)
         self._writer.join()
         self._csv_stream.close()
+        for writer in self._video_writers.values():
+            writer.release()
+        self._video_writers = {}
         with self._lock:
-            self._status.update({"state": "processing", "message": "Creating videos and frame archive"})
+            self._status.update({"state": "processing", "message": "Finalizing video metadata"})
         try:
-            videos = self._create_videos()
-            self._write_metadata(videos)
-            self._create_archive()
+            self._write_metadata(self._video_outputs)
         except Exception as error:
             LOGGER.exception("Recording finalization failed")
             self._write_metadata([])
@@ -297,7 +319,7 @@ class StereoRecorder:
             self._last_upload_batch = batch
         self._start_upload_thread(batch)
 
-    def _create_videos(self):
+    def _open_video_writers(self):
         height, width = self._frame_shape[:2]
         attempts = (("mp4v", ".mp4"), ("MJPG", ".avi"))
         outputs = []
@@ -309,7 +331,7 @@ class StereoRecorder:
                 candidate_path = self._batch / "videos" / f"{eye}{suffix}"
                 candidate_writer = cv2.VideoWriter(
                     str(candidate_path), cv2.VideoWriter_fourcc(*candidate),
-                    float(self.config.camera_fps), (width, height),
+                    float(self._video_fps), (width, height),
                 )
                 if candidate_writer.isOpened():
                     writer, path, codec = candidate_writer, candidate_path, candidate
@@ -317,30 +339,45 @@ class StereoRecorder:
                 candidate_writer.release()
             if writer is None:
                 raise RuntimeError(f"No supported video encoder for {eye} eye")
-            for index in range(self._count):
-                frame = cv2.imread(str(self._batch / "frames" / eye / f"{index:08d}.jpg"))
-                if frame is None:
-                    writer.release()
-                    raise RuntimeError(f"Cannot read {eye} frame {index} during video creation")
-                writer.write(frame)
-            writer.release()
+            self._video_writers[eye] = writer
             outputs.append({"eye": eye, "path": path.relative_to(self._batch).as_posix(), "codec": codec})
-        return outputs
+        self._video_outputs = outputs
 
     def _write_metadata(self, videos):
-        ended_ns = time.time_ns()
+        processed_at_ns = time.time_ns()
+        stopped_ns = self._stopped_wall_ns or processed_at_ns
+        capture_duration = 0.0
+        if (self._first_frame_monotonic_ns is not None
+                and self._last_frame_monotonic_ns is not None):
+            capture_duration = max(
+                0.0,
+                (self._last_frame_monotonic_ns - self._first_frame_monotonic_ns) / 1e9,
+            )
+        effective_fps = (
+            (self._count - 1) / capture_duration
+            if self._count > 1 and capture_duration > 0 else 0.0
+        )
         metadata = {
-            "schema": "babybot.stereo-recording/v1",
+            "schema": "babybot.stereo-recording/v2",
             "batch": self._batch.name,
             "started_at_ns": self._started_wall_ns,
-            "ended_at_ns": ended_ns,
-            "duration_seconds": round((ended_ns - self._started_wall_ns) / 1e9, 6),
+            "stopped_at_ns": stopped_ns,
+            "processed_at_ns": processed_at_ns,
+            "requested_recording_duration_seconds": round(
+                (stopped_ns - self._started_wall_ns) / 1e9, 6
+            ),
+            "capture_duration_seconds": round(capture_duration, 6),
+            "postprocessing_duration_seconds": round(
+                max(0, processed_at_ns - stopped_ns) / 1e9, 6
+            ),
             "paired_frame_count": self._count,
             "submitted_frame_count": self._submitted,
             "width": self._frame_shape[1], "height": self._frame_shape[0],
             "channels": self._frame_shape[2] if len(self._frame_shape) > 2 else 1,
             "configured_fps": self.config.camera_fps,
-            "frame_format": "jpeg", "jpeg_quality": self.config.jpeg_quality,
+            "effective_capture_fps": round(effective_fps, 6),
+            "video_fps": round(self._video_fps, 6),
+            "frame_storage": "paired video streams",
             "pairing": "same grab/retrieve capture cycle",
             "sync_delta_kind": "software gap between completion of left and right grab calls",
             "sync_delta_max_ns": self._sync_delta_max_ns,
@@ -353,12 +390,6 @@ class StereoRecorder:
         temporary = self._batch / "metadata.json.tmp"
         temporary.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         temporary.replace(self._batch / "metadata.json")
-
-    def _create_archive(self):
-        with zipfile.ZipFile(self._batch / "frames.zip", "w", zipfile.ZIP_STORED) as archive:
-            for eye in ("left", "right"):
-                for path in sorted((self._batch / "frames" / eye).glob("*.jpg")):
-                    archive.write(path, path.relative_to(self._batch).as_posix())
 
     def _upload(self, batch):
         with self._upload_lock:

@@ -11,7 +11,7 @@ import threading
 import cv2
 import numpy as np
 
-from main import PreviewStore, make_request_handler
+from main import LatestStereoFrame, PreviewStore, make_request_handler
 from stereo_dataset import StereoDataset
 from stereo_recording import StereoRecorder, StereoRecordingConfig
 
@@ -48,7 +48,8 @@ class StereoRecorderTests(unittest.TestCase):
             left[:] = index * 30
             right[:] = index * 30 + 5
             self.assertTrue(self.recorder.submit(
-                left, right, timestamp_ns=1000 + index, monotonic_ns=2000 + index,
+                left, right, timestamp_ns=1_000_000_000 + index * 100_000_000,
+                monotonic_ns=2_000_000_000 + index * 100_000_000,
                 sync_delta_ns=100 + index,
             ))
         self.assertTrue(self.recorder.stop_async())
@@ -62,14 +63,35 @@ class StereoRecorderTests(unittest.TestCase):
         validation = dataset.validate()
         self.assertTrue(validation["valid"], validation["errors"])
         self.assertEqual(validation["pair_count"], 3)
-        self.assertTrue((batch / "frames.zip").is_file())
+        self.assertFalse((batch / "frames").exists())
+        self.assertFalse((batch / "frames.zip").exists())
         self.assertTrue(any((batch / "videos").glob("left.*")))
         self.assertTrue(any((batch / "videos").glob("right.*")))
+        for eye in ("left", "right"):
+            video_path = next((batch / "videos").glob(f"{eye}.*"))
+            capture = cv2.VideoCapture(str(video_path))
+            try:
+                self.assertTrue(capture.isOpened())
+                self.assertAlmostEqual(capture.get(cv2.CAP_PROP_FPS), 10.0, places=2)
+                self.assertEqual(int(capture.get(cv2.CAP_PROP_FRAME_COUNT)), 3)
+            finally:
+                capture.release()
         metadata = json.loads((batch / "metadata.json").read_text(encoding="utf-8"))
-        self.assertEqual(metadata["schema"], "babybot.stereo-recording/v1")
+        self.assertEqual(metadata["schema"], "babybot.stereo-recording/v2")
         self.assertEqual(metadata["paired_frame_count"], 3)
         self.assertEqual(metadata["pairing"], "same grab/retrieve capture cycle")
         self.assertEqual(metadata["sync_delta_max_ns"], 102)
+        self.assertAlmostEqual(metadata["capture_duration_seconds"], 0.2)
+        self.assertAlmostEqual(metadata["effective_capture_fps"], 10.0)
+        self.assertAlmostEqual(metadata["video_fps"], 10.0)
+
+    def test_recent_capture_rate_is_available_for_video_encoding(self):
+        frames = LatestStereoFrame()
+        image = np.zeros((2, 2, 3), dtype=np.uint8)
+        frames.update(image, image, monotonic_time=10.0)
+        frames.update(image, image, monotonic_time=10.05)
+        frames.update(image, image, monotonic_time=10.10)
+        self.assertAlmostEqual(frames.capture_fps(60.0), 20.0)
 
     def test_state_rejects_a_second_start_and_second_stop(self):
         shape = (12, 16, 3)
