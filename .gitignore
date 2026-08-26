@@ -79,3 +79,6 @@ memory/*
 # Latest generated attention inspection report
 debug/attention_report.html
 debug/attention_report.html.tmp
+
+# Local stereo training recordings (uploaded separately to private TGLgeneral)
+recordings/

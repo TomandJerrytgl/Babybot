@@ -7,6 +7,37 @@ indices, and the Python path if the Jetson uses different values.
 Required Python imports are `numpy` and `cv2`. On Jetson, prefer the OpenCV
 package supplied with JetPack when available.
 
+## Stereo training recordings
+
+The web page now controls paired stereo recording. Local datasets default to
+`recordings/`; that directory is intentionally ignored by the public Babybot
+repository. Each stopped recording keeps all paired JPEG frames, creates left
+and right videos, writes `pairs.csv` and `metadata.json`, and creates
+`frames.zip` for private synchronization.
+
+GitHub visibility is repository-wide, so recordings cannot be private inside
+the public Babybot repository. Prepare a private `TGLgeneral` clone owned by the
+`babybot` service user instead:
+
+```bash
+sudo -u babybot git lfs install
+sudo -u babybot git clone YOUR_PRIVATE_TGLGENERAL_URL /opt/TGLgeneral
+```
+
+Configure SSH keys or another Git credential helper for that service user.
+Never put a token in the service file or source code. Then add these arguments
+to `ExecStart`:
+
+```text
+--recording-root /opt/babybot-data/recordings --upload-repo /opt/TGLgeneral
+```
+
+The account needs write access to `TGLgeneral`, and the repository needs enough
+Git LFS storage and bandwidth. Upload failures leave local data intact and can
+be retried from the web page. A clone of the private dataset is directly
+readable with `StereoDataset`; if only `frames.zip` is present, the reader
+restores `frames/` automatically.
+
 After copying the project and checking that `python3 main.py` works manually:
 
 ```bash

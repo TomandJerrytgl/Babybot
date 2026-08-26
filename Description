@@ -256,3 +256,22 @@ not read, modified or deleted.
 - The browser and report show a fully filled pseudocolor Lab label mask, the original
   perception with colored boundaries, and the visual/stereo merged masks for each eye.
   It is self-contained, embeds all images, and never creates an automatic history.
+
+## 2026-08 Stereo training recording stage
+
+- The existing port-forwarded web page provides start/stop controls for stereo
+  training recording; recording has no fixed duration or batch-count limit.
+- Each successful camera `grab`/`retrieve` cycle is treated as one paired sample.
+  Left and right full-resolution JPEG frames are stored separately with shared
+  indices and capture timestamps in `pairs.csv`.
+- Every batch also contains `metadata.json`, separately encoded left/right videos,
+  and a `frames.zip` transport archive. Local source frames remain available.
+- `StereoDataset` is the stable model-independent training input. It iterates paired
+  BGR images, validates the manifest, and restores `frames/` from the archive when a
+  private repository clone only contains the transport form.
+- Finalized data is synchronized to `babybot/stereo_test_data/` in a separately
+  cloned private `TGLgeneral` repository through Git LFS. Git authentication remains
+  external to the source code. A failed upload never removes the local recording.
+- Recording disk I/O runs outside the camera thread. If its bounded queue cannot
+  keep up, a frame cannot be written, or the free-space reserve is reached, recording
+  stops safely and reports the failure rather than silently dropping paired samples.

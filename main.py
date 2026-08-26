@@ -27,6 +27,7 @@ from attention import Attention
 from observation import Observation
 from perception import Perception
 from region_proposal import RegionProposalConfig, StereoRegionProposer
+from stereo_recording import StereoRecorder, StereoRecordingConfig
 
 
 LOGGER = logging.getLogger("babybot")
@@ -126,6 +127,11 @@ class RuntimeConfig:
     region_growth_threshold: float = 14.0
     minimum_merge_score: float = 0.65
     stereo_merge_weight: float = 0.12
+    recording_root: str = "recordings"
+    recording_jpeg_quality: int = 95
+    recording_queue_capacity: int = 512
+    upload_repository: str = ""
+    upload_subdirectory: str = "babybot/stereo_test_data"
 
     def attention_settings(self):
         return {
@@ -431,7 +437,9 @@ def write_attention_report(path, perception, result, identifier, jpeg_quality, c
 
 
 def make_request_handler(previews, report_path="debug/attention_report.html",
-                         request_capture=None):
+                         request_capture=None, recording_status=None,
+                         start_recording=None, stop_recording=None,
+                         retry_recording_upload=None):
     class PreviewHandler(BaseHTTPRequestHandler):
         def do_GET(self):
             path = self.path.split("?", 1)[0]
@@ -442,7 +450,10 @@ def make_request_handler(previews, report_path="debug/attention_report.html",
                     ".eyes{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}img{width:100%;height:auto;background:#222}"
                     ".cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}.card{background:#222;padding:10px}"
                     "pre{white-space:pre-wrap;font-size:12px}h1,h2{font-weight:500}button{font-size:18px;padding:12px 20px;cursor:pointer}"
-                    "button:disabled{opacity:.55;cursor:wait}</style></head><body><h1>Babybot visual front end</h1>"
+                    "button:disabled{opacity:.55;cursor:wait}.recording{background:#301818;padding:14px;margin:16px 0}</style></head><body><h1>Babybot visual front end</h1>"
+                    "<section class='recording'><h2>Stereo training recorder</h2><p id='recording-status'>Loading recorder status...</p>"
+                    "<p><button id='record-start'>Start recording</button> <button id='record-stop'>Stop recording</button> "
+                    "<button id='upload-retry'>Retry upload</button></p></section>"
                     "<h2>Raw observation — target 20 Hz — no overlay</h2><div class='eyes'><section><h3>Left eye</h3><img id='observation-left'></section>"
                     "<section><h3>Right eye</h3><img id='observation-right'></section></div>"
                     "<p><button id='capture'>Capture and calculate</button></p>"
@@ -474,13 +485,32 @@ def make_request_handler(previews, report_path="debug/attention_report.html",
                     "if(s.ready&&s.perception_id!==shown){showResult(s);document.getElementById('timing').textContent='Perception '+s.perception_id+' | left '+s.left_elapsed_ms+' ms | right '+s.right_elapsed_ms+' ms | total '+s.total_elapsed_ms+' ms'}}catch(e){}setTimeout(status,300)}"
                     "document.getElementById('capture').onclick=async()=>{let b=document.getElementById('capture');b.disabled=true;"
                     "try{await fetch('/action/capture',{method:'POST'})}catch(e){b.disabled=false}};"
-                    "refresh('observation',50);status()</script></body></html>"
+                    "async function recordingStatus(){try{let r=await fetch('/status/recording.json?t='+Date.now()),s=await r.json();"
+                    "let text=s.message+' | pairs '+s.paired_frame_count+' | '+Number(s.duration_seconds).toFixed(1)+' s';"
+                    "if(s.batch)text+=' | '+s.batch;if(s.upload_message)text+=' | '+s.upload_message;if(s.error)text+=' | ERROR: '+s.error;"
+                    "if(s.upload_error)text+=' | UPLOAD ERROR: '+s.upload_error;document.getElementById('recording-status').textContent=text;"
+                    "document.getElementById('record-start').disabled=s.state!=='idle';document.getElementById('record-stop').disabled=!s.recording;"
+                    "document.getElementById('upload-retry').disabled=s.upload_state!=='failed'}catch(e){}setTimeout(recordingStatus,500)}"
+                    "async function postAction(path){try{await fetch(path,{method:'POST'})}catch(e){}}"
+                    "document.getElementById('record-start').onclick=()=>postAction('/action/record/start');"
+                    "document.getElementById('record-stop').onclick=()=>postAction('/action/record/stop');"
+                    "document.getElementById('upload-retry').onclick=()=>postAction('/action/record/retry-upload');"
+                    "refresh('observation',50);status();recordingStatus()</script></body></html>"
                 ).encode("utf-8")
                 self._send_bytes(body, "text/html; charset=utf-8")
                 return
             if path == "/status/attention.json":
                 self._send_bytes(
                     json.dumps(previews.attention_status()).encode("utf-8"),
+                    "application/json", no_store=True,
+                )
+                return
+            if path == "/status/recording.json":
+                if recording_status is None:
+                    self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "Recording unavailable")
+                    return
+                self._send_bytes(
+                    json.dumps(recording_status()).encode("utf-8"),
                     "application/json", no_store=True,
                 )
                 return
@@ -515,14 +545,21 @@ def make_request_handler(previews, report_path="debug/attention_report.html",
 
         def do_POST(self):
             path = self.path.split("?", 1)[0]
-            if path != "/action/capture":
+            actions = {
+                "/action/capture": (request_capture, "Capture control unavailable"),
+                "/action/record/start": (start_recording, "Recording control unavailable"),
+                "/action/record/stop": (stop_recording, "Recording control unavailable"),
+                "/action/record/retry-upload": (retry_recording_upload, "Upload retry unavailable"),
+            }
+            if path not in actions:
                 self.send_error(HTTPStatus.NOT_FOUND, html.escape(path))
                 return
-            if request_capture is None:
-                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "Capture control unavailable")
+            action, unavailable_message = actions[path]
+            if action is None:
+                self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, unavailable_message)
                 return
-            if not request_capture():
-                self.send_error(HTTPStatus.CONFLICT, "Capture already pending or calculating")
+            if not action():
+                self.send_error(HTTPStatus.CONFLICT, "Action is not valid in the current state")
                 return
             body = b'{"accepted":true}'
             self.send_response(HTTPStatus.ACCEPTED)
@@ -563,6 +600,14 @@ class BabybotRuntime:
         self.config = config
         self.previews = PreviewStore()
         self.latest_frames = LatestStereoFrame()
+        self.recorder = StereoRecorder(StereoRecordingConfig(
+            data_root=config.recording_root,
+            camera_fps=config.camera_fps,
+            jpeg_quality=config.recording_jpeg_quality,
+            queue_capacity=config.recording_queue_capacity,
+            upload_repository=config.upload_repository,
+            upload_subdirectory=config.upload_subdirectory,
+        ))
         self.stop_event = threading.Event()
         self.capture_request_event = threading.Event()
         self.left_camera = None
@@ -603,6 +648,21 @@ class BabybotRuntime:
         self.capture_request_event.set()
         return True
 
+    def request_recording_start(self):
+        snapshot = self.latest_frames.snapshot(copy=False)
+        if snapshot is None:
+            return False
+        left, right, _version = snapshot
+        if left.shape != right.shape:
+            return False
+        return self.recorder.start(left.shape)
+
+    def request_recording_stop(self):
+        return self.recorder.stop_async()
+
+    def request_recording_upload_retry(self):
+        return self.recorder.retry_upload()
+
     def _open_camera(self, index):
         camera = cv2.VideoCapture(index, cv2.CAP_V4L2)
         camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -628,13 +688,17 @@ class BabybotRuntime:
         raise InterruptedError("Stopped before cameras opened")
 
     def _capture_pair(self):
-        if not self.left_camera.grab() or not self.right_camera.grab():
+        if not self.left_camera.grab():
             return None
+        left_grab_ns = time.monotonic_ns()
+        if not self.right_camera.grab():
+            return None
+        right_grab_ns = time.monotonic_ns()
         left_ok, left = self.left_camera.retrieve()
         right_ok, right = self.right_camera.retrieve()
         if not left_ok or not right_ok or left is None or right is None:
             return None
-        return left, right
+        return left, right, abs(right_grab_ns - left_grab_ns)
 
     def _warm_up(self):
         LOGGER.info("Warming cameras for %.1f seconds", self.config.warmup_seconds)
@@ -649,7 +713,15 @@ class BabybotRuntime:
         while not self.stop_event.is_set():
             pair = self._capture_pair()
             if pair is not None:
-                self.latest_frames.update(*pair)
+                left, right, sync_delta_ns = pair
+                self.latest_frames.update(left, right)
+                capture_wall_ns = time.time_ns()
+                capture_monotonic_ns = time.monotonic_ns()
+                self.recorder.submit(
+                    left, right, timestamp_ns=capture_wall_ns,
+                    monotonic_ns=capture_monotonic_ns,
+                    sync_delta_ns=sync_delta_ns,
+                )
                 continue
             if time.monotonic() - last_log >= 2.0:
                 LOGGER.error("Stereo frame failed; retrying")
@@ -732,6 +804,10 @@ class BabybotRuntime:
         handler = make_request_handler(
             self.previews, self.config.attention_report_path,
             self.request_attention_capture,
+            self.recorder.status,
+            self.request_recording_start,
+            self.request_recording_stop,
+            self.request_recording_upload_retry,
         )
         self.web_server = ThreadingHTTPServer((self.config.web_host, self.config.web_port), handler)
         self.web_thread = threading.Thread(
@@ -753,6 +829,7 @@ class BabybotRuntime:
     def shutdown(self):
         self.stop_event.set()
         self.capture_request_event.set()
+        self.recorder.shutdown()
         self.attention_pool.shutdown(wait=True, cancel_futures=True)
         for worker in (self.capture_thread, self.observation_preview_thread):
             if worker is not None and worker is not threading.current_thread():
@@ -772,6 +849,14 @@ def parse_args():
     parser.add_argument("--left-camera", type=int, default=0)
     parser.add_argument("--right-camera", type=int, default=2)
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--recording-root", default="recordings")
+    parser.add_argument(
+        "--upload-repo", default=os.environ.get("BABYBOT_TGLGENERAL_REPO", ""),
+        help="Path to an existing private TGLgeneral Git clone",
+    )
+    parser.add_argument(
+        "--upload-subdirectory", default="babybot/stereo_test_data",
+    )
     return parser.parse_args()
 
 
@@ -782,6 +867,9 @@ def main():
         left_camera=args.left_camera,
         right_camera=args.right_camera,
         web_port=args.port,
+        recording_root=args.recording_root,
+        upload_repository=args.upload_repo,
+        upload_subdirectory=args.upload_subdirectory,
     ))
     signal.signal(signal.SIGINT, runtime.request_stop)
     signal.signal(signal.SIGTERM, runtime.request_stop)
