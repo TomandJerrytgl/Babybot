@@ -37,6 +37,10 @@ class RecordingLibrary:
     def __init__(self, root):
         self.root = Path(root)
         self._cache = {}
+        self._playback_lock = threading.Lock()
+        self._playback_batch = None
+        self._playback_captures = {}
+        self._playback_next_frame = 0
 
     def list(self):
         self.root.mkdir(parents=True, exist_ok=True)
@@ -107,23 +111,68 @@ class RecordingLibrary:
                 return path
         raise FileNotFoundError
 
+    def paired_frame_jpeg(self, batch, frame_index, quality=85):
+        """Decode one matched left/right frame and return a browser-safe JPEG."""
+        frame_index = int(frame_index)
+        if frame_index < 0:
+            raise ValueError("Frame index must be non-negative")
+        with self._playback_lock:
+            if self._playback_batch != batch:
+                self._close_playback_locked()
+                captures = {
+                    eye: cv2.VideoCapture(str(self.video_path(batch, eye)))
+                    for eye in ("left", "right")
+                }
+                if not all(capture.isOpened() for capture in captures.values()):
+                    for capture in captures.values():
+                        capture.release()
+                    raise ValueError("Saved stereo video cannot be decoded")
+                self._playback_batch = batch
+                self._playback_captures = captures
+                self._playback_next_frame = 0
+            if frame_index != self._playback_next_frame:
+                for capture in self._playback_captures.values():
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            frames = []
+            for eye in ("left", "right"):
+                ok, frame = self._playback_captures[eye].read()
+                if not ok:
+                    raise IndexError("Frame is outside the saved recording")
+                frames.append(frame)
+            self._playback_next_frame = frame_index + 1
+            return encode_jpeg(cv2.hconcat(frames), quality)
+
+    def close(self):
+        with self._playback_lock:
+            self._close_playback_locked()
+
+    def _close_playback_locked(self):
+        for capture in self._playback_captures.values():
+            capture.release()
+        self._playback_captures = {}
+        self._playback_batch = None
+        self._playback_next_frame = 0
+
 
 RECORD_PAGE = """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width'>
 <title>Babybot Record</title><style>body{font-family:sans-serif;background:#111;color:#eee;margin:20px}button,select{font-size:16px;padding:9px}.eyes{display:grid;grid-template-columns:1fr 1fr;gap:12px}.eyes img,.eyes video{width:100%;background:#222}pre{white-space:pre-wrap}.panel{background:#202020;padding:14px;margin:14px 0}</style></head>
 <body><h1>Babybot Record mode</h1><section class='panel'><p id='status'>Loading...</p><button id='start'>Start recording</button> <button id='stop'>Stop recording</button> <button id='retry'>Retry upload</button></section>
 <h2>Live stereo preview</h2><div class='eyes'><img id='live-left'><img id='live-right'></div>
 <section class='panel'><h2>Saved recording inspector</h2><select id='batches'></select> <button id='reload'>Reload</button><pre id='details'></pre>
-<div class='eyes'><video id='video-left' controls></video><video id='video-right' controls></video></div>
-<p><button id='back'>Previous frame</button> <button id='forward'>Next frame</button></p></section>
+<p>Paired playback: left eye | right eye</p><img id='playback' style='width:100%;background:#222'>
+<p><button id='play'>Play</button> <button id='pause'>Pause</button> <button id='back'>Previous frame</button> <button id='forward'>Next frame</button></p>
+<input id='timeline' type='range' min='0' max='0' value='0' style='width:100%'><p id='frame-label'></p></section>
 <script>async function post(p){let r=await fetch(p,{method:'POST'});if(!r.ok)throw Error(await r.text())}
 const startButton=document.getElementById('start'),stopButton=document.getElementById('stop'),retryButton=document.getElementById('retry'),batchSelect=document.getElementById('batches'),detailsElement=document.getElementById('details');
 async function status(){try{let s=await(await fetch('/status.json?t='+Date.now())).json();let encoder=s.encoder||'waiting for first frame';document.getElementById('status').textContent=`${s.message}\nState: ${s.state} | Encoder: ${encoder}\nFrames: ${s.paired_frame_count}/${s.submitted_frame_count} | Queue: ${s.queued_pairs}/${s.queue_capacity} (${s.queue_percent}%)\nUpload: ${s.upload_state}`;startButton.disabled=s.state!=='idle';stopButton.disabled=!s.recording;retryButton.disabled=s.upload_state!=='failed'}catch(e){}setTimeout(status,500)}
 function preview(e){let i=document.getElementById('live-'+e);i.onload=i.onerror=()=>setTimeout(()=>preview(e),60);i.src='/preview/'+e+'.jpg?t='+Date.now()}
-let records=[];async function load(){records=await(await fetch('/recordings.json?t='+Date.now())).json();batchSelect.replaceChildren(...records.map(x=>new Option(x.batch,x.batch)));choose()}
-function choose(){let x=records.find(x=>x.batch===batchSelect.value);if(!x)return;detailsElement.textContent=JSON.stringify(x,null,2);['left','right'].forEach(e=>{let v=document.getElementById('video-'+e);v.src='/media/'+x.batch+'/'+e;v.dataset.fps=(x.videos[e]&&x.videos[e].fps)||20})}
-function sync(source,target){source.addEventListener('play',()=>target.play());source.addEventListener('pause',()=>target.pause());source.addEventListener('seeked',()=>{if(Math.abs(target.currentTime-source.currentTime)>.03)target.currentTime=source.currentTime});source.addEventListener('ratechange',()=>target.playbackRate=source.playbackRate)}
+let records=[],playing=false,playTimer=null,playback=document.getElementById('playback'),timeline=document.getElementById('timeline'),frameLabel=document.getElementById('frame-label');async function load(){records=await(await fetch('/recordings.json?t='+Date.now())).json();batchSelect.replaceChildren(...records.map(x=>new Option(x.batch,x.batch)));choose()}
+function selected(){return records.find(x=>x.batch===batchSelect.value)}
+function showFrame(n){let x=selected();if(!x)return;let total=Math.max(0,x.paired_frame_count||0);n=Math.max(0,Math.min(Number(n)||0,Math.max(0,total-1)));timeline.value=n;frameLabel.textContent=`Frame ${n+1} / ${total}`;playback.src=`/paired-frame/${x.batch}/${n}.jpg?t=${Date.now()}`}
+function choose(){playing=false;clearTimeout(playTimer);let x=selected();if(!x)return;detailsElement.textContent=JSON.stringify(x,null,2);timeline.max=Math.max(0,(x.paired_frame_count||0)-1);timeline.value=0;showFrame(0)}
+function playbackStep(){if(!playing)return;let x=selected(),next=Number(timeline.value)+1;if(!x||next>=x.paired_frame_count){playing=false;return}showFrame(next);let fps=(x.videos.left&&x.videos.left.fps)||20;playTimer=setTimeout(playbackStep,1000/Math.max(1,fps))}
 startButton.onclick=()=>post('/action/start');stopButton.onclick=()=>post('/action/stop');retryButton.onclick=()=>post('/action/retry-upload');document.getElementById('reload').onclick=load;batchSelect.onchange=choose;
-let l=document.getElementById('video-left'),r=document.getElementById('video-right');sync(l,r);function frameStep(){return 1/Math.max(1,parseFloat(l.dataset.fps)||20)}back.onclick=()=>{l.pause();l.currentTime=Math.max(0,l.currentTime-frameStep());r.currentTime=l.currentTime};forward.onclick=()=>{l.pause();l.currentTime+=frameStep();r.currentTime=l.currentTime};preview('left');preview('right');status();load()</script></body></html>"""
+document.getElementById('play').onclick=()=>{if(!playing){playing=true;playbackStep()}};document.getElementById('pause').onclick=()=>{playing=false;clearTimeout(playTimer)};document.getElementById('back').onclick=()=>{playing=false;showFrame(Number(timeline.value)-1)};document.getElementById('forward').onclick=()=>{playing=false;showFrame(Number(timeline.value)+1)};timeline.oninput=()=>{playing=false;clearTimeout(playTimer);showFrame(timeline.value)};preview('left');preview('right');status();load()</script></body></html>"""
 
 
 def make_record_handler(runtime):
@@ -147,6 +196,15 @@ def make_record_handler(runtime):
                 try:
                     return self.send_file(runtime.library.video_path(parts[1], parts[2]))
                 except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
+                    return self.send_error(HTTPStatus.NOT_FOUND)
+            if (len(parts) == 3 and parts[0] == "paired-frame"
+                    and parts[2].endswith(".jpg")):
+                try:
+                    frame_index = int(parts[2][:-4])
+                    body = runtime.library.paired_frame_jpeg(parts[1], frame_index)
+                    return self.send_bytes(body, "image/jpeg")
+                except (FileNotFoundError, OSError, ValueError, IndexError,
+                        json.JSONDecodeError):
                     return self.send_error(HTTPStatus.NOT_FOUND)
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -247,7 +305,7 @@ class RecordRuntime:
         threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     def close(self):
-        self.recorder.shutdown(); self.camera.release(); self.server.server_close()
+        self.recorder.shutdown(); self.library.close(); self.camera.release(); self.server.server_close()
         if self.camera_thread: self.camera_thread.join(timeout=2)
 
 

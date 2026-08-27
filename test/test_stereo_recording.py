@@ -72,6 +72,13 @@ class StereoRecorderTests(unittest.TestCase):
         self.assertTrue(inspection["valid"], inspection)
         self.assertEqual(inspection["videos"]["left"]["frames"], 3)
         self.assertEqual(inspection["videos"]["right"]["frames"], 3)
+        library = RecordingLibrary(self.temporary.name)
+        paired_jpeg = library.paired_frame_jpeg(batch.name, 1)
+        paired_image = cv2.imdecode(np.frombuffer(paired_jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        self.assertEqual(paired_image.shape[:2], (24, 64))
+        with self.assertRaises(IndexError):
+            library.paired_frame_jpeg(batch.name, 99)
+        library.close()
         self.assertFalse((batch / "frames").exists())
         self.assertFalse((batch / "frames.zip").exists())
         self.assertTrue(any((batch / "videos").glob("left.*")))
@@ -134,10 +141,19 @@ class RecordingWebApiTests(unittest.TestCase):
         shape = (12, 16, 3)
         image = np.zeros(shape, dtype=np.uint8)
         self.frames.update(image, image)
+        self.assertTrue(self.recorder.start(shape))
+        self.assertTrue(self.recorder.submit(image, image))
+        self.assertTrue(self.recorder.stop_async())
+        saved = wait_until(
+            lambda: self.recorder.status()
+            if self.recorder.status()["state"] == "idle" else None
+        )
+        self.saved_batch = saved["batch"]
+        self.library = RecordingLibrary(self.temporary.name)
         runtime = SimpleNamespace(
             recorder=self.recorder,
             frames=self.frames,
-            library=RecordingLibrary(self.temporary.name),
+            library=self.library,
             start_recording=lambda: self.recorder.start(shape),
         )
         handler = make_record_handler(runtime)
@@ -151,6 +167,7 @@ class RecordingWebApiTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
+        self.library.close()
         self.temporary.cleanup()
 
     def post(self, path):
@@ -160,8 +177,19 @@ class RecordingWebApiTests(unittest.TestCase):
         page = urlopen(self.base_url + "/", timeout=2).read().decode("utf-8")
         self.assertIn("Babybot Record mode", page)
         self.assertIn("Saved recording inspector", page)
+        self.assertIn("/paired-frame/", page)
         self.assertIn("stopButton.onclick=", page)
         self.assertNotIn("stop.onclick=", page)
+        paired = urlopen(
+            f"{self.base_url}/paired-frame/{self.saved_batch}/0.jpg", timeout=2
+        ).read()
+        image = cv2.imdecode(np.frombuffer(paired, dtype=np.uint8), cv2.IMREAD_COLOR)
+        self.assertEqual(image.shape[:2], (12, 32))
+        with self.assertRaises(HTTPError) as missing:
+            urlopen(
+                f"{self.base_url}/paired-frame/{self.saved_batch}/99.jpg", timeout=2
+            )
+        self.assertEqual(missing.exception.code, 404)
         self.assertEqual(self.post("/action/start").status, 202)
         status = json.loads(urlopen(
             self.base_url + "/status.json", timeout=2
