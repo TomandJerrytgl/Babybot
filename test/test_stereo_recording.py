@@ -46,6 +46,9 @@ class StereoRecorderTests(unittest.TestCase):
         left = np.zeros((24, 32, 3), dtype=np.uint8)
         right = np.zeros((24, 32, 3), dtype=np.uint8)
         self.assertTrue(self.recorder.start(left.shape))
+        initial_status = self.recorder.status()
+        self.assertEqual(initial_status["queue_capacity"], 8)
+        self.assertEqual(initial_status["queue_percent"], 0.0)
         for index in range(3):
             left[:] = index * 30
             right[:] = index * 30 + 5
@@ -90,6 +93,19 @@ class StereoRecorderTests(unittest.TestCase):
         self.assertAlmostEqual(metadata["capture_duration_seconds"], 0.2)
         self.assertAlmostEqual(metadata["effective_capture_fps"], 10.0)
         self.assertAlmostEqual(metadata["video_fps"], 10.0)
+        self.assertEqual(metadata["videos"][0]["codec"], "MJPG")
+
+    def test_status_reports_encoder_and_queue_progress(self):
+        image = np.zeros((24, 32, 3), dtype=np.uint8)
+        self.assertTrue(self.recorder.start(image.shape))
+        self.assertTrue(self.recorder.submit(image, image))
+        status = wait_until(
+            lambda: self.recorder.status()
+            if self.recorder.status()["paired_frame_count"] == 1 else None
+        )
+        self.assertEqual(status["encoder"], "MJPG")
+        self.assertEqual(status["submitted_frame_count"], 1)
+        self.assertEqual(status["queue_capacity"], 8)
 
     def test_recent_capture_rate_is_available_for_video_encoding(self):
         frames = LatestStereoFrame()
@@ -144,6 +160,8 @@ class RecordingWebApiTests(unittest.TestCase):
         page = urlopen(self.base_url + "/", timeout=2).read().decode("utf-8")
         self.assertIn("Babybot Record mode", page)
         self.assertIn("Saved recording inspector", page)
+        self.assertIn("stopButton.onclick=", page)
+        self.assertNotIn("stop.onclick=", page)
         self.assertEqual(self.post("/action/start").status, 202)
         status = json.loads(urlopen(
             self.base_url + "/status.json", timeout=2

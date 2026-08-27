@@ -116,12 +116,13 @@ RECORD_PAGE = """<!doctype html><html><head><meta charset='utf-8'><meta name='vi
 <div class='eyes'><video id='video-left' controls></video><video id='video-right' controls></video></div>
 <p><button id='back'>Previous frame</button> <button id='forward'>Next frame</button></p></section>
 <script>async function post(p){let r=await fetch(p,{method:'POST'});if(!r.ok)throw Error(await r.text())}
-async function status(){try{let s=await(await fetch('/status.json?t='+Date.now())).json();document.getElementById('status').textContent=JSON.stringify(s);start.disabled=s.state!=='idle';stop.disabled=!s.recording;retry.disabled=s.upload_state!=='failed'}catch(e){}setTimeout(status,500)}
+const startButton=document.getElementById('start'),stopButton=document.getElementById('stop'),retryButton=document.getElementById('retry'),batchSelect=document.getElementById('batches'),detailsElement=document.getElementById('details');
+async function status(){try{let s=await(await fetch('/status.json?t='+Date.now())).json();let encoder=s.encoder||'waiting for first frame';document.getElementById('status').textContent=`${s.message}\nState: ${s.state} | Encoder: ${encoder}\nFrames: ${s.paired_frame_count}/${s.submitted_frame_count} | Queue: ${s.queued_pairs}/${s.queue_capacity} (${s.queue_percent}%)\nUpload: ${s.upload_state}`;startButton.disabled=s.state!=='idle';stopButton.disabled=!s.recording;retryButton.disabled=s.upload_state!=='failed'}catch(e){}setTimeout(status,500)}
 function preview(e){let i=document.getElementById('live-'+e);i.onload=i.onerror=()=>setTimeout(()=>preview(e),60);i.src='/preview/'+e+'.jpg?t='+Date.now()}
-let records=[];async function load(){records=await(await fetch('/recordings.json?t='+Date.now())).json();batches.replaceChildren(...records.map(x=>new Option(x.batch,x.batch)));choose()}
-function choose(){let x=records.find(x=>x.batch===batches.value);if(!x)return;details.textContent=JSON.stringify(x,null,2);['left','right'].forEach(e=>{let v=document.getElementById('video-'+e);v.src='/media/'+x.batch+'/'+e;v.dataset.fps=(x.videos[e]&&x.videos[e].fps)||20})}
+let records=[];async function load(){records=await(await fetch('/recordings.json?t='+Date.now())).json();batchSelect.replaceChildren(...records.map(x=>new Option(x.batch,x.batch)));choose()}
+function choose(){let x=records.find(x=>x.batch===batchSelect.value);if(!x)return;detailsElement.textContent=JSON.stringify(x,null,2);['left','right'].forEach(e=>{let v=document.getElementById('video-'+e);v.src='/media/'+x.batch+'/'+e;v.dataset.fps=(x.videos[e]&&x.videos[e].fps)||20})}
 function sync(source,target){source.addEventListener('play',()=>target.play());source.addEventListener('pause',()=>target.pause());source.addEventListener('seeked',()=>{if(Math.abs(target.currentTime-source.currentTime)>.03)target.currentTime=source.currentTime});source.addEventListener('ratechange',()=>target.playbackRate=source.playbackRate)}
-start.onclick=()=>post('/action/start');stop.onclick=()=>post('/action/stop');retry.onclick=()=>post('/action/retry-upload');reload.onclick=load;batches.onchange=choose;
+startButton.onclick=()=>post('/action/start');stopButton.onclick=()=>post('/action/stop');retryButton.onclick=()=>post('/action/retry-upload');document.getElementById('reload').onclick=load;batchSelect.onchange=choose;
 let l=document.getElementById('video-left'),r=document.getElementById('video-right');sync(l,r);function frameStep(){return 1/Math.max(1,parseFloat(l.dataset.fps)||20)}back.onclick=()=>{l.pause();l.currentTime=Math.max(0,l.currentTime-frameStep());r.currentTime=l.currentTime};forward.onclick=()=>{l.pause();l.currentTime+=frameStep();r.currentTime=l.currentTime};preview('left');preview('right');status();load()</script></body></html>"""
 
 
@@ -240,6 +241,9 @@ class RecordRuntime:
 
     def stop(self, *_args):
         self.stop_event.set()
+        if self.recorder.status()["recording"]:
+            self.recorder.stop_async()
+            LOGGER.info("Shutdown requested; no new frames will be recorded")
         threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     def close(self):

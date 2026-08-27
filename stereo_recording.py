@@ -29,6 +29,7 @@ class StereoRecordingConfig:
     minimum_free_bytes: int = 2 * 1024 * 1024 * 1024
     upload_repository: str = ""
     upload_subdirectory: str = "babybot/stereo_test_data"
+    video_codecs: tuple = (("MJPG", ".avi"), ("mp4v", ".mp4"))
 
 
 class GitLfsUploader:
@@ -122,6 +123,7 @@ class StereoRecorder:
             "paired_frame_count": 0, "duration_seconds": 0.0,
             "batch": None, "upload_configured": self.uploader.configured,
             "upload_state": "idle",
+            "encoder": None, "queue_capacity": config.queue_capacity,
         }
 
     def status(self):
@@ -132,6 +134,15 @@ class StereoRecorder:
                     time.monotonic() - self._started_monotonic, 1
                 )
             result["queued_pairs"] = 0 if self._queue is None else self._queue.qsize()
+            result["queue_capacity"] = self.config.queue_capacity
+            result["queue_percent"] = round(
+                100.0 * result["queued_pairs"] / max(1, self.config.queue_capacity), 1
+            )
+            result["submitted_frame_count"] = self._submitted
+            if result["state"] == "stopping":
+                result["message"] = (
+                    f"Finishing {result['queued_pairs']} queued stereo pairs"
+                )
             return result
 
     def start(self, frame_shape, video_fps=None):
@@ -173,6 +184,7 @@ class StereoRecorder:
                 "paired_frame_count": 0, "duration_seconds": 0.0,
                 "batch": name, "error": None, "upload_path": None,
                 "video_fps": round(self._video_fps, 3),
+                "encoder": None,
             })
             self._writer = threading.Thread(
                 target=self._writer_loop, name="stereo-frame-writer", daemon=True
@@ -228,10 +240,26 @@ class StereoRecorder:
         return True
 
     def shutdown(self, timeout=30.0):
-        self.stop_async()
+        was_recording = self.stop_async()
+        if was_recording:
+            LOGGER.info("Recording stopped; finishing queued stereo pairs")
         worker = self._finalizer
         if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=timeout)
+            deadline = time.monotonic() + timeout
+            while worker.is_alive() and time.monotonic() < deadline:
+                worker.join(timeout=min(2.0, max(0.0, deadline - time.monotonic())))
+                if worker.is_alive():
+                    status = self.status()
+                    LOGGER.info(
+                        "Still finalizing recording (%d stereo pairs queued)",
+                        status["queued_pairs"],
+                    )
+            if worker.is_alive():
+                LOGGER.error(
+                    "Recording finalization exceeded %.1f seconds; local files may be incomplete",
+                    timeout,
+                )
+                return False
         deadline = time.monotonic() + timeout
         with self._lock:
             upload_threads = list(self._upload_threads)
@@ -240,6 +268,7 @@ class StereoRecorder:
             if remaining <= 0:
                 break
             upload_thread.join(timeout=remaining)
+        return True
 
     def _writer_loop(self):
         while True:
@@ -288,7 +317,15 @@ class StereoRecorder:
             self.stop_async()
 
     def _finish(self, work_queue):
-        work_queue.put(None)
+        # The writer normally drains the queue before consuming this marker. If
+        # it already failed, do not block forever trying to insert into a full queue.
+        if self._writer.is_alive():
+            while self._writer.is_alive():
+                try:
+                    work_queue.put(None, timeout=0.25)
+                    break
+                except queue.Full:
+                    continue
         self._writer.join()
         self._csv_stream.close()
         for writer in self._video_writers.values():
@@ -321,27 +358,39 @@ class StereoRecorder:
 
     def _open_video_writers(self):
         height, width = self._frame_shape[:2]
-        attempts = (("mp4v", ".mp4"), ("MJPG", ".avi"))
-        outputs = []
-        for eye in ("left", "right"):
-            writer = None
-            path = None
-            codec = None
-            for candidate, suffix in attempts:
-                candidate_path = self._batch / "videos" / f"{eye}{suffix}"
-                candidate_writer = cv2.VideoWriter(
-                    str(candidate_path), cv2.VideoWriter_fourcc(*candidate),
-                    float(self._video_fps), (width, height),
-                )
-                if candidate_writer.isOpened():
-                    writer, path, codec = candidate_writer, candidate_path, candidate
-                    break
-                candidate_writer.release()
-            if writer is None:
-                raise RuntimeError(f"No supported video encoder for {eye} eye")
-            self._video_writers[eye] = writer
-            outputs.append({"eye": eye, "path": path.relative_to(self._batch).as_posix(), "codec": codec})
-        self._video_outputs = outputs
+        for candidate, suffix in self.config.video_codecs:
+            writers = {}
+            outputs = []
+            try:
+                for eye in ("left", "right"):
+                    candidate_path = self._batch / "videos" / f"{eye}{suffix}"
+                    candidate_writer = cv2.VideoWriter(
+                        str(candidate_path), cv2.VideoWriter_fourcc(*candidate),
+                        float(self._video_fps), (width, height),
+                    )
+                    if not candidate_writer.isOpened():
+                        candidate_writer.release()
+                        raise RuntimeError(f"{candidate} did not open for {eye}")
+                    writers[eye] = candidate_writer
+                    outputs.append({
+                        "eye": eye,
+                        "path": candidate_path.relative_to(self._batch).as_posix(),
+                        "codec": candidate,
+                    })
+            except RuntimeError:
+                for writer in writers.values():
+                    writer.release()
+                for eye in ("left", "right"):
+                    candidate_path = self._batch / "videos" / f"{eye}{suffix}"
+                    candidate_path.unlink(missing_ok=True)
+                continue
+            self._video_writers = writers
+            self._video_outputs = outputs
+            with self._lock:
+                self._status["encoder"] = candidate
+            LOGGER.info("Recording stereo video with %s%s", candidate, suffix)
+            return
+        raise RuntimeError("No supported stereo video encoder")
 
     def _write_metadata(self, videos):
         processed_at_ns = time.time_ns()
