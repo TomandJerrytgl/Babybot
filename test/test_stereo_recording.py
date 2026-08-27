@@ -7,11 +7,13 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from http.server import ThreadingHTTPServer
 import threading
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
 
-from main import LatestStereoFrame, PreviewStore, make_request_handler
+from record import RecordingLibrary, make_record_handler
+from stereo_camera import LatestStereoFrame
 from stereo_dataset import StereoDataset
 from stereo_recording import StereoRecorder, StereoRecordingConfig
 
@@ -63,6 +65,10 @@ class StereoRecorderTests(unittest.TestCase):
         validation = dataset.validate()
         self.assertTrue(validation["valid"], validation["errors"])
         self.assertEqual(validation["pair_count"], 3)
+        inspection = RecordingLibrary(self.temporary.name).inspect(batch)
+        self.assertTrue(inspection["valid"], inspection)
+        self.assertEqual(inspection["videos"]["left"]["frames"], 3)
+        self.assertEqual(inspection["videos"]["right"]["frames"], 3)
         self.assertFalse((batch / "frames").exists())
         self.assertFalse((batch / "frames.zip").exists())
         self.assertTrue(any((batch / "videos").glob("left.*")))
@@ -108,14 +114,17 @@ class RecordingWebApiTests(unittest.TestCase):
         self.recorder = StereoRecorder(StereoRecordingConfig(
             data_root=self.temporary.name, camera_fps=5.0
         ))
+        self.frames = LatestStereoFrame()
         shape = (12, 16, 3)
-        handler = make_request_handler(
-            PreviewStore(),
-            recording_status=self.recorder.status,
+        image = np.zeros(shape, dtype=np.uint8)
+        self.frames.update(image, image)
+        runtime = SimpleNamespace(
+            recorder=self.recorder,
+            frames=self.frames,
+            library=RecordingLibrary(self.temporary.name),
             start_recording=lambda: self.recorder.start(shape),
-            stop_recording=self.recorder.stop_async,
-            retry_recording_upload=self.recorder.retry_upload,
         )
+        handler = make_record_handler(runtime)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -133,16 +142,17 @@ class RecordingWebApiTests(unittest.TestCase):
 
     def test_page_and_recording_actions_are_available(self):
         page = urlopen(self.base_url + "/", timeout=2).read().decode("utf-8")
-        self.assertIn("Stereo training recorder", page)
-        self.assertEqual(self.post("/action/record/start").status, 202)
+        self.assertIn("Babybot Record mode", page)
+        self.assertIn("Saved recording inspector", page)
+        self.assertEqual(self.post("/action/start").status, 202)
         status = json.loads(urlopen(
-            self.base_url + "/status/recording.json", timeout=2
+            self.base_url + "/status.json", timeout=2
         ).read())
         self.assertTrue(status["recording"])
         with self.assertRaises(HTTPError) as context:
-            self.post("/action/record/start")
+            self.post("/action/start")
         self.assertEqual(context.exception.code, 409)
-        self.assertEqual(self.post("/action/record/stop").status, 202)
+        self.assertEqual(self.post("/action/stop").status, 202)
 
 
 if __name__ == "__main__":

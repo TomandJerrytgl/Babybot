@@ -259,7 +259,7 @@ not read, modified or deleted.
 
 ## 2026-08 Stereo training recording stage
 
-- The existing port-forwarded web page provides start/stop controls for stereo
+- The independent Record mode web page provides start/stop controls for stereo
   training recording; recording has no fixed duration or batch-count limit.
 - Each successful camera `grab`/`retrieve` cycle is treated as one paired sample.
   Its shared index, capture timestamp and measured software synchronization gap
@@ -279,3 +279,28 @@ not read, modified or deleted.
 - The video frame rate is estimated from recent live capture timing before recording.
   Metadata separately records requested duration, timestamp-derived capture duration,
   effective capture FPS, video FPS and post-processing duration.
+
+## 2026-08 Awake, Record and Dreaming architecture
+
+- `awake.py` is the named live-cognition entry point on port 8080. `main.py`
+  remains compatible and exposes the same manual Observation, Perception and
+  Attention behavior as the stabilized visual front end.
+- `record.py` owns camera-only data collection on port 8081. It records and uploads
+  v2 paired videos without touching Memory. Its browser lists local v1/v2 batches,
+  validates both streams and provides synchronized playback and frame stepping.
+- `dreaming.py` runs on port 8082 without camera or Jetson dependencies. It reads
+  local v1/v2 datasets, processes every frame by default (or strides of 2/5/10),
+  runs the current visual proposal and Attention pipeline, and retains paired and
+  single-eye objects. Single-eye depth and physical size remain explicitly unknown.
+- Possible repeated Dreaming objects pause for user decisions: same, different, or
+  unsure. Clearly new objects are added automatically; near-identical samples are
+  skipped. The page supports pause, resume, stop and one-frame debugging.
+- `SharedMemory` has no object/sample capacity limit. SQLite is a local index while
+  sample images remain separate files. Transactions plus a process lock guard
+  accidental concurrent writers. Awake evidence has priority 100 and Dreaming 10;
+  lower-priority evidence may enrich but never demote an Awake identity.
+- Legacy `memory/manifest.json` content is imported as Awake-priority evidence on
+  first use. Local Memory is not synchronized through GitHub in this stage.
+- `FeatureTrainer` establishes a replaceable neural-feature API and explicitly
+  reports that no neural trainer is configured. PyTorch and motion learning are not
+  dependencies or implemented features in this stage.

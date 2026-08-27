@@ -1,5 +1,5 @@
 [Unit]
-Description=Babybot Awake mode
+Description=Babybot Record mode
 After=network-online.target
 Wants=network-online.target
 
@@ -8,10 +8,10 @@ Type=simple
 User=Tom
 Group=video
 WorkingDirectory=/home/Tom/Babybot
-ExecStart=/usr/bin/python3 /home/Tom/Babybot/awake.py --left-camera 0 --right-camera 2 --port 8080 --memory /home/Tom/Babybot/memory
+ExecStart=/usr/bin/python3 /home/Tom/Babybot/record.py --left-camera 0 --right-camera 2 --port 8081 --recording-root /home/Tom/Babybot/recordings --upload-repo /home/Tom/TGLgeneral
 Restart=on-failure
 RestartSec=2
-TimeoutStopSec=10
+TimeoutStopSec=30
 KillSignal=SIGTERM
 
 [Install]
